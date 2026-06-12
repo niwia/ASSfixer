@@ -44,7 +44,9 @@ from pathlib import Path
 # Constants
 # ──────────────────────────────────────────────────────────────
 
-DEFAULT_CONFIG_PATH = Path.home() / ".config" / "SLSsteam" / "config.yaml"
+FLATPAK_CONFIG_PATH = Path.home() / ".var" / "app" / "com.valvesoftware.Steam" / ".config" / "SLSsteam" / "config.yaml"
+NATIVE_CONFIG_PATH = Path.home() / ".config" / "SLSsteam" / "config.yaml"
+DEFAULT_CONFIG_PATH = FLATPAK_CONFIG_PATH if FLATPAK_CONFIG_PATH.exists() else NATIVE_CONFIG_PATH
 
 # The C++ source file that contains the YAML default template as a raw string literal.
 # Fetching this directly always gives us the latest upstream template.
