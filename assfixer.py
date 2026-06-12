@@ -983,8 +983,66 @@ def main():
     print(f"{BOLD}{'='*60}{RESET}")
     print()
 
-    # If --config is not explicitly passed in command line arguments, ask interactively
-    if "--config" not in sys.argv:
+    # Detect if we should run interactively
+    cli_flags = ["--config", "--output", "--dry-run", "--no-backup", "--validate-only"]
+    interactive = not any(flag in sys.argv for flag in cli_flags)
+
+    choice = 1
+    config_path = args.config
+
+    if interactive:
+        print("Please select an option:")
+        print("  1) Clean & Update Config (normal flow)")
+        print("  2) Restore Backup (from config.bck)")
+        print("  3) Apply Recommended Settings for Steam Deck (SafeMode, Notifications, LogLevel: 2, etc.)")
+        while True:
+            try:
+                user_choice = input("Enter choice (1-3, default: 1): ").strip()
+            except (KeyboardInterrupt, EOFError):
+                print("\nCancelled.")
+                sys.exit(0)
+            if not user_choice:
+                choice = 1
+                break
+            if user_choice in ("1", "2", "3"):
+                choice = int(user_choice)
+                break
+            print("Invalid choice. Please enter a number between 1 and 3.")
+        print()
+
+    # If Option 2 (Restore Backup)
+    if interactive and choice == 2:
+        print(f"Default config location is: {DEFAULT_CONFIG_PATH}")
+        while True:
+            try:
+                user_input = input(f"Enter path to your config.yaml (press Enter for default): ").strip()
+            except (KeyboardInterrupt, EOFError):
+                print("\nCancelled.")
+                sys.exit(0)
+            if not user_input:
+                config_path = DEFAULT_CONFIG_PATH
+            else:
+                config_path = Path(user_input).expanduser().resolve()
+            
+            bak_path = config_path.with_suffix(".bck")
+            if bak_path.exists():
+                break
+            else:
+                error(f"Backup file not found: {bak_path}. Please try again.")
+                print()
+        
+        info(f"Restoring backup from {bak_path} to {config_path}...")
+        try:
+            shutil.copy2(bak_path, config_path)
+            ok("Backup successfully restored.")
+        except Exception as exc:
+            error(f"Failed to restore backup: {exc}")
+            sys.exit(1)
+        print()
+        return
+
+    # If Option 1 or 3 (or CLI non-interactive flow)
+    if interactive:
         print(f"Default config location is: {DEFAULT_CONFIG_PATH}")
         while True:
             try:
@@ -1053,6 +1111,19 @@ def main():
     # ── 2.5 Resolve missing names ────────────────────────────────
     resolve_missing_names(old_data)
     print()
+
+    # ── 2.8 Apply overrides (Steam Deck presets) ─────────────────
+    if interactive and choice == 3:
+        info("Applying Steam Deck recommended overrides:")
+        info("  SafeMode: yes")
+        info("  Notifications: yes")
+        info("  LogLevel: 2")
+        info("  ExtendedLogging: no")
+        old_data["SafeMode"] = "yes"
+        old_data["Notifications"] = "yes"
+        old_data["LogLevel"] = "2"
+        old_data["ExtendedLogging"] = "no"
+        print()
 
     # ── 3. Fetch template from GitHub ────────────────────────────
     print(f"{BOLD}[3/4] Fetching latest template from GitHub...{RESET}")
