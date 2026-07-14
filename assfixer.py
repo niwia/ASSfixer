@@ -327,8 +327,13 @@ class ConfigEntry:
 # ──────────────────────────────────────────────────────────────
 
 class SimpleYAMLReader:
-    def __init__(self, key_types: Optional[dict] = None):
+    def __init__(self, key_types: Optional[dict] = None, lenient: bool = True):
+        """
+        lenient=True  → user config: tries to salvage malformed/unindented blocks
+        lenient=False → template parsing: strict only (no salvage needed)
+        """
         self._key_types = key_types or {}
+        self._lenient   = lenient
 
     def _ktype(self, key: str) -> str:
         return self._key_types.get(key, TYPE_UNKNOWN)
@@ -365,21 +370,30 @@ class SimpleYAMLReader:
                 i += 1
                 continue
 
+            children_start = i + 1
+
             if ktype == TYPE_LIST:
-                items, i = self._read_list(lines, i + 1, n, key)
+                items, i = self._read_list(lines, children_start, n, key)
+                if not items and self._lenient:
+                    items, i = self._salvage_block(lines, children_start, n, key, expect_list=True)
                 result[key] = items
+
             elif ktype in (TYPE_MAP, TYPE_MAP_OF_LISTS):
-                mapping, i = self._read_map(lines, i + 1, n, key, ktype)
+                mapping, i = self._read_map(lines, children_start, n, key, ktype)
+                if not mapping and self._lenient:
+                    mapping, i = self._salvage_block(lines, children_start, n, key, expect_list=False)
                 result[key] = mapping
+
             elif key == IDLE_STATUS_KEY or ktype == TYPE_SUBMAP:
-                submap, i = self._read_submap(lines, i + 1, n)
+                submap, i = self._read_submap(lines, children_start, n)
                 result[key] = submap
+
             elif ktype == TYPE_SCALAR:
                 result[key] = None
                 i += 1
+
             else:
                 # TYPE_UNKNOWN — auto-detect from actual content in this config
-                children_start = i + 1
                 j = children_start
                 while j < n and (not lines[j].strip() or lines[j].strip().startswith("#")):
                     j += 1
@@ -390,9 +404,12 @@ class SimpleYAMLReader:
                         items, i = self._read_list(lines, children_start, n, key)
                         result[key] = items
                     else:
-                        # Could be a map or a submap — treat as map
                         mapping, i = self._read_map(lines, children_start, n, key, TYPE_MAP)
                         result[key] = mapping
+                elif self._lenient:
+                    # No properly-indented children — try lenient salvage
+                    block, i = self._salvage_block(lines, children_start, n, key)
+                    result[key] = block
                 else:
                     result[key] = None
                     i += 1
@@ -425,6 +442,107 @@ class SimpleYAMLReader:
             items.append(ConfigEntry(None, entry_val))
             i += 1
         return items, i
+
+    def _salvage_block(
+        self, lines, start: int, n: int, parent_key: str,
+        expect_list: Optional[bool] = None
+    ) -> tuple:
+        """
+        Lenient fallback reader: reads until the next unambiguous top-level key,
+        stripping leading garbage characters and salvaging any recognisable entries.
+
+        expect_list=True   → prefer list entries
+        expect_list=False  → prefer map entries
+        expect_list=None   → auto-decide from what we find
+
+        Orphaned values (e.g. a bare number with no map key) are discarded with
+        a warning so the user knows what was dropped.
+        """
+        map_entries:  dict = {}
+        list_entries: list = []
+        discarded:    int  = 0
+        i = start
+
+        while i < n:
+            line     = lines[i]
+            stripped = line.strip()
+
+            if not stripped:
+                i += 1
+                continue
+
+            # A non-indented top-level key pattern → stop the block
+            if (not line.startswith(" ")
+                    and re.match(r'^[A-Za-z][A-Za-z0-9_]*\s*:', line)):
+                break
+
+            # Inline comments → preserve them in output
+            if stripped.startswith("#"):
+                i += 1
+                continue
+
+            # Strip leading garbage chars (---, !, %, etc.) to expose the value.
+            # We do this by finding the first digit or letter and taking from there.
+            clean_m = re.match(r'^[^A-Za-z0-9]*(\d.*|[A-Za-z].*)', stripped)
+            clean = clean_m.group(1).strip() if clean_m else ""
+            if not clean:
+                i += 1
+                continue
+
+            # Try: DIGITS: DIGITS  (numeric map entry like ManifestIds, AppTokens)
+            m_map_num = re.match(r'^(\d+)\s*:\s*(\d+)\s*(#.*)?$', clean)
+            if m_map_num:
+                k, v, cmt = m_map_num.group(1), m_map_num.group(2), m_map_num.group(3)
+                entry_val = f"{v} {cmt.strip()}" if cmt else v
+                map_entries[k] = ConfigEntry(k, entry_val)
+                i += 1
+                continue
+
+            # Try: WORD: ANYTHING  (string map entry like FakeAppIds, GameTitles)
+            m_map_str = re.match(r'^([\w]+)\s*:\s*(.+)$', clean)
+            if m_map_str:
+                k, v = m_map_str.group(1), m_map_str.group(2).strip()
+                if expect_list is not True:   # don't treat as map if we expect a list
+                    cleaned_v = self._clean_map_value(parent_key, v)
+                    if cleaned_v is not None:
+                        map_entries[k] = ConfigEntry(k, cleaned_v)
+                        i += 1
+                        continue
+
+            # Try: - DIGITS  or just DIGITS  (list entry)
+            m_list = re.match(r'^(?:-\s+)?(\d+)\s*(#.*)?$', clean)
+            if m_list:
+                num, cmt = m_list.group(1), m_list.group(2)
+                entry_val = f"{num} {cmt.strip()}" if cmt else num
+                # Orphaned value: only add as list entry if there's no key portion
+                # A plain number with no ': value' part is orphaned in a map context
+                if ":" not in clean:  # truly standalone
+                    if expect_list is not False and not map_entries:
+                        list_entries.append(ConfigEntry(None, entry_val))
+                    else:
+                        warn(f"  {parent_key}: discarding orphaned value '{num}' (no key:value pair)")
+                        discarded += 1
+                i += 1
+                continue
+
+            # Unrecognisable → discard
+            warn(f"  {parent_key}: discarding unrecognized entry: '{stripped[:60]}'")
+            discarded += 1
+            i += 1
+
+        total_salvaged = len(map_entries) + len(list_entries)
+        if total_salvaged or discarded:
+            if total_salvaged:
+                info(f"  {parent_key}: salvaged {total_salvaged} entr{'y' if total_salvaged == 1 else 'ies'}"
+                     f" from malformed block{f', discarded {discarded} invalid line(s)' if discarded else ''}")
+            else:
+                warn(f"  {parent_key}: could not salvage any valid entries ({discarded} invalid line(s) discarded)")
+
+        if map_entries:
+            return map_entries, i
+        if list_entries:
+            return list_entries, i
+        return None, i
 
     def _read_map(self, lines, start, n, parent_key, ktype) -> tuple:
         result_map: dict = {}
@@ -656,7 +774,12 @@ def _render_map(mapping: dict, parent_key: str, indent: str = "  ") -> str:
 
 
 def _render_submap(submap: dict, indent: str = "  ") -> str:
-    return "\n".join(f"{indent}{k}: {v}" for k, v in submap.items())
+    out = []
+    for k, v in submap.items():
+        # v may be a plain string or a ConfigEntry (defensive)
+        val_str = v.val if isinstance(v, ConfigEntry) else str(v)
+        out.append(f"{indent}{k}: {val_str}")
+    return "\n".join(out)
 
 
 def merge_config(template_yaml: str, user_data: dict, key_types: dict) -> str:
@@ -769,9 +892,9 @@ def run_asshead_migration(
         template_yaml = m.group(1) if m else ""
 
         config_text   = config_path.read_text(encoding="utf-8")
-        reader        = SimpleYAMLReader(key_types)
+        reader        = SimpleYAMLReader(key_types, lenient=True)
         old_data      = reader.parse(config_text)
-        template_data = reader.parse(template_yaml)
+        template_data = SimpleYAMLReader(key_types, lenient=False).parse(template_yaml)
 
         issues   = validate_config(config_path, key_types)
         new_keys = set(template_data) - set(old_data)
