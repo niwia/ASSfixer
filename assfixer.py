@@ -6,9 +6,12 @@ Fetches the latest default config template from the SLSsteam GitHub repo,
 parses your existing config.yaml, and produces a perfectly-formatted output
 that carries over ALL your personal values into the new template structure.
 
-Key types are dynamically inferred from the fetched template — the tool
-automatically adapts to new or removed keys added by the SLSsteam developer
-without any manual script updates needed.
+This tool is fully self-adapting: key types are inferred automatically from:
+  1. Inline default values in the template (scalar detection)
+  2. Commented-out examples in the template header (list vs map detection)
+  3. The structure of your own config.yaml for any remaining unknowns
+
+No manual updates are needed when the SLSsteam developer adds or removes keys.
 
 Preserved exactly as-is (with normalized spacing):
   - AdditionalApps / AppIds / FakeOffline  list items + their inline comments
@@ -34,7 +37,6 @@ Options:
     --validate-only       Only check for errors in your current config, don't write
     --no-resolve-names    Skip outbound SteamCMD API calls for game name resolution
     --template-url URL    Override the GitHub raw URL for the default config template
-    --hints-url URL       Override the GitHub raw URL for the key-type hints JSON
     --version             Show version and exit
 """
 
@@ -54,7 +56,7 @@ from typing import Optional
 # Version
 # ──────────────────────────────────────────────────────────────
 
-VERSION = "3.0.0"
+VERSION = "3.1.0"
 
 # ──────────────────────────────────────────────────────────────
 # Path / URL constants
@@ -72,18 +74,11 @@ TEMPLATE_SOURCE_URL = (
     "https://raw.githubusercontent.com/AceSLS/SLSsteam/main/src/config_default.hpp"
 )
 
-# Small JSON file in THIS repo that maps ambiguous empty-default keys to their type.
-# This only needs updating when the SLSsteam dev adds a brand-new key with no
-# default value (empty `key:`) — existing keys never change type.
-KEY_HINTS_URL = (
-    "https://raw.githubusercontent.com/niwia/ASSfixer/main/key_hints.json"
-)
-
 TEMPLATE_TIMEOUT  = 15   # seconds – GitHub raw file download
 STEAM_API_TIMEOUT =  5   # seconds – per-game name lookups (many in parallel)
 
 # ──────────────────────────────────────────────────────────────
-# Key type constants (used as values in the inferred type map)
+# Key type constants
 # ──────────────────────────────────────────────────────────────
 
 TYPE_SCALAR       = "scalar"        # single value (yes/no, number, string)
@@ -91,13 +86,13 @@ TYPE_LIST         = "list"          # sequence of `  - item` entries
 TYPE_MAP          = "map"           # mapping of `  key: value` entries
 TYPE_MAP_OF_LISTS = "map_of_lists"  # mapping whose values are sub-lists
 TYPE_SUBMAP       = "submap"        # fixed-key sub-map (e.g. IdleStatus)
-TYPE_UNKNOWN      = "unknown"       # fallback — pass through as-is
+TYPE_UNKNOWN      = "unknown"       # auto-detected at parse time from user data
 
-# Numeric-validated map keys: values must be integers (Steam IDs / manifest IDs)
-# This is a narrow hint because it affects value sanitization, not structure.
+# These map keys expect numeric (integer) values — used for sanity-checking.
+# This list rarely changes since it reflects Steam's numeric ID system.
 NUMERIC_VALUE_MAP_KEYS = {
-    "AppTokens", "FakeAppIds", "SubscriptionTimestamps", "ManifestIds",
-    "DlcData",
+    "AppTokens", "FakeAppIds", "SubscriptionTimestamps",
+    "ManifestIds", "DlcData",
 }
 
 IDLE_STATUS_KEY = "IdleStatus"
@@ -160,19 +155,6 @@ def fetch_template(url: str = TEMPLATE_SOURCE_URL) -> str:
     return m.group(1)
 
 
-def fetch_key_hints(url: str = KEY_HINTS_URL) -> dict:
-    """
-    Download the key_hints.json from the ASSfixer repo.
-    Returns a dict mapping key_name -> type string.
-    Falls back to an empty dict if unavailable (best-effort).
-    """
-    try:
-        raw = _fetch_url(url, TEMPLATE_TIMEOUT)
-        return json.loads(raw)
-    except Exception:
-        return {}
-
-
 def lookup_steam_name(app_id: str) -> Optional[str]:
     try:
         url = f"https://store.steampowered.com/api/appdetails?appids={app_id}&filters=basic"
@@ -186,24 +168,81 @@ def lookup_steam_name(app_id: str) -> Optional[str]:
 
 
 # ──────────────────────────────────────────────────────────────
-# Dynamic key-type inference from template
+# Dynamic key-type inference — no external hints file needed
 # ──────────────────────────────────────────────────────────────
 
-def infer_key_types(template_yaml: str, hints: dict) -> dict:
+def _parse_commented_examples(raw_hpp: str) -> dict:
     """
-    Parse the template YAML to discover the type of each top-level key.
+    Parse commented-out YAML examples from the template header to infer
+    the type of keys that would otherwise be ambiguous (empty defaults).
 
-    Returns a dict: { key_name: TYPE_* }
-
-    Type inference rules:
-      - `key: yes` / `key: no`        → TYPE_SCALAR (boolean)
-      - `key: <number>`               → TYPE_SCALAR (numeric)
-      - `key: "<string>"` / similar   → TYPE_SCALAR
-      - `key:` then `  - item`        → TYPE_LIST
-      - `key:` then `  word: value`   → TYPE_MAP or TYPE_SUBMAP
-      - `key:` then `  word:\n    -`  → TYPE_MAP_OF_LISTS
-      - `key:` with no children       → look up in hints; TYPE_UNKNOWN if missing
+    Looks for blocks like:
+        #SomeKey:
+        #  - item        → list
+        #  key: value    → map
+        #  key:          → map_of_lists (if sub-children exist)
     """
+    inferred: dict[str, str] = {}
+    lines = raw_hpp.splitlines()
+
+    i = 0
+    while i < len(lines):
+        # Match a commented-out top-level key: `#KeyName:`
+        m = re.match(r'^#([A-Za-z][A-Za-z0-9_]*)\s*:\s*$', lines[i].strip())
+        if not m:
+            i += 1
+            continue
+
+        key = m.group(1)
+        # Look at the next commented child line
+        j = i + 1
+        while j < len(lines) and (not lines[j].strip() or lines[j].strip() == "#"):
+            j += 1
+
+        if j < len(lines):
+            child = lines[j].strip().lstrip("#").strip()
+            if child.startswith("- ") or child == "-":
+                inferred[key] = TYPE_LIST
+            elif ":" in child:
+                # Check if grandchild is a list item → map_of_lists
+                k = j + 1
+                while k < len(lines) and (not lines[k].strip() or lines[k].strip() == "#"):
+                    k += 1
+                if k < len(lines):
+                    grandchild = lines[k].strip().lstrip("#").strip()
+                    if grandchild.startswith("- ") or grandchild == "-":
+                        inferred[key] = TYPE_MAP_OF_LISTS
+                    else:
+                        inferred[key] = TYPE_MAP
+                else:
+                    inferred[key] = TYPE_MAP
+            else:
+                inferred[key] = TYPE_SUBMAP
+        i += 1
+
+    return inferred
+
+
+def infer_key_types(raw_hpp: str) -> dict:
+    """
+    Auto-discover the type of every top-level config key without any external
+    hints file. Uses two passes:
+
+    Pass 1 — Template body: keys with non-empty defaults are detected as scalars;
+              keys with indented children are detected as list/map/submap.
+    Pass 2 — Template header comments: looks for commented-out example blocks
+              (e.g. `#AppIds:\n#  - 440`) to infer types for empty-default keys.
+
+    Any key still unresolved is tagged TYPE_UNKNOWN; the parser will auto-detect
+    its type from the actual content of the user's config at parse time.
+    """
+    # --- Pass 2 first: scan commented examples from the full hpp source ---
+    comment_hints = _parse_commented_examples(raw_hpp)
+
+    # --- Pass 1: extract the YAML template body ---
+    m = re.search(r'static const char\* defaultConfig = R"\((.+?)\)";', raw_hpp, re.DOTALL)
+    template_yaml = m.group(1) if m else ""
+
     key_types: dict[str, str] = {}
     lines = template_yaml.splitlines()
     i = 0
@@ -211,62 +250,53 @@ def infer_key_types(template_yaml: str, hints: dict) -> dict:
 
     while i < n:
         line = lines[i]
-        # Skip blank lines and comment-only lines
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             i += 1
             continue
 
-        # Top-level key: must start with no indentation
-        m = re.match(r'^([A-Za-z][A-Za-z0-9_]*)\s*:\s*(.*)', line)
-        if not m:
+        m2 = re.match(r'^([A-Za-z][A-Za-z0-9_]*)\s*:\s*(.*)', line)
+        if not m2:
             i += 1
             continue
 
-        key   = m.group(1)
-        value = m.group(2).strip()
+        key   = m2.group(1)
+        value = m2.group(2).strip()
 
         if value and not value.startswith("#"):
-            # Key has an inline value → scalar
+            # Has inline value → scalar
             key_types[key] = TYPE_SCALAR
             i += 1
             continue
 
-        # Key is empty (`key:` with optional comment). Look ahead at children.
+        # Empty default — look ahead at template children
         j = i + 1
-        # Skip comment lines directly after the key
         while j < n and (not lines[j].strip() or lines[j].strip().startswith("#")):
             j += 1
 
-        # Check if there are indented children
         if j < n and lines[j].startswith("  ") and not lines[j].strip().startswith("#"):
             child_line = lines[j].strip()
-
             if child_line.startswith("- ") or child_line == "-":
                 key_types[key] = TYPE_LIST
-
             else:
-                # Child is `word: value` or `word:` (submap or map or map-of-lists)
                 child_m = re.match(r'^([^:]+):\s*(.*)', child_line)
                 if child_m:
                     child_val = child_m.group(2).strip()
-                    # Peek one more level: is the grandchild a list item?
+                    # Peek at grandchild
                     k = j + 1
                     while k < n and (not lines[k].strip() or lines[k].strip().startswith("#")):
                         k += 1
                     if k < n and lines[k].startswith("    ") and lines[k].strip().startswith("- "):
                         key_types[key] = TYPE_MAP_OF_LISTS
                     elif not child_val or child_val.startswith("#"):
-                        # Child also has no value — treat as submap (fixed sub-keys like IdleStatus)
                         key_types[key] = TYPE_SUBMAP
                     else:
                         key_types[key] = TYPE_MAP
                 else:
                     key_types[key] = TYPE_UNKNOWN
         else:
-            # Completely empty key — use hints or fall back to unknown
-            hint = hints.get(key, TYPE_UNKNOWN)
-            key_types[key] = hint
+            # Completely empty — use comment example hints, else unknown
+            key_types[key] = comment_hints.get(key, TYPE_UNKNOWN)
 
         i += 1
 
@@ -274,13 +304,13 @@ def infer_key_types(template_yaml: str, hints: dict) -> dict:
 
 
 # ──────────────────────────────────────────────────────────────
-# ConfigEntry dataclass (key + raw value string preserving comments)
+# ConfigEntry dataclass
 # ──────────────────────────────────────────────────────────────
 
 @dataclass
 class ConfigEntry:
     key: Optional[str]   # None for list items
-    val: str             # the raw value string (may include inline comment)
+    val: str             # raw value string (may include inline comment)
 
     def __hash__(self):
         return hash((self.key, self.val.split("#")[0].strip()))
@@ -293,18 +323,11 @@ class ConfigEntry:
 
 
 # ──────────────────────────────────────────────────────────────
-# SimpleYAMLReader  — parses the user's config.yaml
+# SimpleYAMLReader
 # ──────────────────────────────────────────────────────────────
 
 class SimpleYAMLReader:
-    """
-    A hand-rolled parser that understands enough SLSsteam YAML to round-trip it
-    perfectly. Avoids PyYAML so no extra dependency is needed.
-    """
-
     def __init__(self, key_types: Optional[dict] = None):
-        # key_types is the inferred map from infer_key_types().
-        # If not provided, all keys default to TYPE_UNKNOWN (passthrough).
         self._key_types = key_types or {}
 
     def _ktype(self, key: str) -> str:
@@ -319,7 +342,6 @@ class SimpleYAMLReader:
         while i < n:
             line = lines[i]
             stripped = line.strip()
-
             if not stripped or stripped.startswith("#"):
                 i += 1
                 continue
@@ -334,17 +356,15 @@ class SimpleYAMLReader:
             ktype = self._ktype(key)
 
             if value and not value.startswith("#"):
-                # Inline scalar value
                 if ktype == TYPE_LIST:
                     result[key] = self._parse_scalar_as_list(value)
                 elif ktype == TYPE_MAP:
                     result[key] = self._parse_scalar_as_map(key, value)
                 else:
-                    result[key] = self._clean_scalar(key, value)
+                    result[key] = self._clean_scalar(value)
                 i += 1
                 continue
 
-            # No inline value — collect indented children
             if ktype == TYPE_LIST:
                 items, i = self._read_list(lines, i + 1, n, key)
                 result[key] = items
@@ -358,17 +378,19 @@ class SimpleYAMLReader:
                 result[key] = None
                 i += 1
             else:
-                # TYPE_UNKNOWN: try to auto-detect from children
+                # TYPE_UNKNOWN — auto-detect from actual content in this config
                 children_start = i + 1
                 j = children_start
                 while j < n and (not lines[j].strip() or lines[j].strip().startswith("#")):
                     j += 1
+
                 if j < n and lines[j].startswith("  ") and not lines[j].strip().startswith("#"):
                     child = lines[j].strip()
                     if child.startswith("- ") or child == "-":
                         items, i = self._read_list(lines, children_start, n, key)
                         result[key] = items
                     else:
+                        # Could be a map or a submap — treat as map
                         mapping, i = self._read_map(lines, children_start, n, key, TYPE_MAP)
                         result[key] = mapping
                 else:
@@ -379,7 +401,7 @@ class SimpleYAMLReader:
 
     # ── Child-block readers ────────────────────────────────────
 
-    def _read_list(self, lines, start, n, parent_key) -> tuple[list, int]:
+    def _read_list(self, lines, start, n, parent_key) -> tuple:
         items = []
         i = start
         while i < n:
@@ -404,7 +426,7 @@ class SimpleYAMLReader:
             i += 1
         return items, i
 
-    def _read_map(self, lines, start, n, parent_key, ktype) -> tuple[dict, int]:
+    def _read_map(self, lines, start, n, parent_key, ktype) -> tuple:
         result_map: dict = {}
         i = start
         while i < n:
@@ -430,8 +452,7 @@ class SimpleYAMLReader:
                 i += 1
                 while i < n:
                     sub_line = lines[i]
-                    sub_stripped = sub_line.strip()
-                    if not sub_stripped or sub_stripped.startswith("#"):
+                    if not sub_line.strip() or sub_line.strip().startswith("#"):
                         i += 1
                         continue
                     if not sub_line.startswith("    "):
@@ -448,19 +469,18 @@ class SimpleYAMLReader:
                 result_map[k] = sub if sub else None
             else:
                 cleaned = self._clean_map_value(parent_key, val)
-                if cleaned:
+                if cleaned is not None:
                     result_map[k] = ConfigEntry(k, cleaned)
                 i += 1
 
         return result_map, i
 
-    def _read_submap(self, lines, start, n) -> tuple[dict, int]:
+    def _read_submap(self, lines, start, n) -> tuple:
         sub: dict = {}
         i = start
         while i < n:
             line = lines[i]
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#"):
+            if not line.strip() or line.strip().startswith("#"):
                 i += 1
                 continue
             if not line.startswith(" "):
@@ -469,15 +489,13 @@ class SimpleYAMLReader:
             if not mm:
                 i += 1
                 continue
-            k   = mm.group(1).strip()
-            val = mm.group(2).strip()
-            sub[k] = val
+            sub[mm.group(1).strip()] = mm.group(2).strip()
             i += 1
         return sub, i
 
     # ── Value sanitizers ───────────────────────────────────────
 
-    def _clean_scalar(self, key: str, val: str) -> str:
+    def _clean_scalar(self, val: str) -> str:
         val = val.strip()
         m = re.match(r'^([^#]+?)\s*(#.*)?$', val)
         if not m:
@@ -486,23 +504,27 @@ class SimpleYAMLReader:
         cmt = m.group(2)
         return f"{v} {cmt.strip()}" if cmt else v
 
-    def _clean_map_value(self, parent_key: str, val: str) -> str:
-        """Sanitize a mapping entry's value string; return '' to discard."""
+    def _clean_map_value(self, parent_key: str, val: str) -> Optional[str]:
+        """
+        Sanitize a mapping entry's value string.
+        Returns None only if the value is completely unparseable (empty/broken).
+        For numeric-expected keys, emits a warning but still keeps the value.
+        """
+        if not val or val.startswith("#"):
+            return None
         m = re.match(r'^([^#\s]+)\s*(#.*)?$', val)
         if not m:
-            return ""
+            return None
         v_part  = m.group(1).strip()
         comment = m.group(2)
-        if parent_key in NUMERIC_VALUE_MAP_KEYS:
-            if not v_part.isdigit():
-                return ""
-            return f"{v_part} {comment.strip()}" if comment else v_part
-        if parent_key == "GameTitles":
-            v_quoted = sanitize_title(v_part)
-            return f"{v_quoted} {comment.strip()}" if comment else v_quoted
-        return val
 
-    # ── Scalar-encoded structures ─────────────────────────────
+        if parent_key in NUMERIC_VALUE_MAP_KEYS and not v_part.isdigit():
+            warn(f"  {parent_key}: unexpected non-numeric value '{v_part}' — keeping as-is")
+
+        if parent_key == "GameTitles":
+            v_part = sanitize_title(v_part)
+
+        return f"{v_part} {comment.strip()}" if comment else v_part
 
     def _parse_scalar_as_list(self, val: str) -> list:
         val = val.strip().strip("[]")
@@ -512,8 +534,7 @@ class SimpleYAMLReader:
             m    = re.match(r'^([0-9]+)\s*(#.*)?$', part)
             if m:
                 num, comment = m.group(1), m.group(2)
-                raw_val = f"{num} {comment.strip()}" if comment else num
-                result.append(ConfigEntry(None, raw_val))
+                result.append(ConfigEntry(None, f"{num} {comment.strip()}" if comment else num))
         return result
 
     def _parse_scalar_as_map(self, parent_key: str, val: str) -> dict:
@@ -529,7 +550,7 @@ class SimpleYAMLReader:
             if not k.isdigit():
                 continue
             cleaned = self._clean_map_value(parent_key, v)
-            if cleaned:
+            if cleaned is not None:
                 result[k] = ConfigEntry(k, cleaned)
         return result
 
@@ -547,7 +568,7 @@ def dedup_list(items: list) -> list:
 
 
 def dedup_map(mapping: dict) -> dict:
-    return dict(mapping)   # dict already deduplicates by key
+    return dict(mapping)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -555,7 +576,6 @@ def dedup_map(mapping: dict) -> dict:
 # ──────────────────────────────────────────────────────────────
 
 def resolve_missing_names(config_data: dict) -> None:
-    """Fill in missing inline comments (game names) for list/map entries in parallel."""
     tasks = []
 
     def collect(entries):
@@ -568,7 +588,7 @@ def resolve_missing_names(config_data: dict) -> None:
                 if isinstance(v, ConfigEntry) and "#" not in v.val:
                     tasks.append(v)
 
-    for key, val in config_data.items():
+    for val in config_data.values():
         collect(val)
 
     if not tasks:
@@ -576,10 +596,7 @@ def resolve_missing_names(config_data: dict) -> None:
 
     info(f"Resolving {len(tasks)} game name(s) via Steam API…")
     with ThreadPoolExecutor(max_workers=8) as pool:
-        futures = {}
-        for entry in tasks:
-            app_id = entry.val.split()[0]
-            futures[pool.submit(lookup_steam_name, app_id)] = entry
+        futures = {pool.submit(lookup_steam_name, e.val.split()[0]): e for e in tasks}
         for fut in as_completed(futures):
             entry = futures[fut]
             name  = fut.result()
@@ -591,7 +608,7 @@ def resolve_missing_names(config_data: dict) -> None:
 # Config validator
 # ──────────────────────────────────────────────────────────────
 
-def validate_config(config_path: Path, key_types: dict) -> list[str]:
+def validate_config(config_path: Path, key_types: dict) -> list:
     issues = []
     text   = config_path.read_text(encoding="utf-8")
     lines  = text.splitlines()
@@ -604,7 +621,7 @@ def validate_config(config_path: Path, key_types: dict) -> list[str]:
             if parts[0].rstrip() != parts[0]:
                 issues.append(f"Line {lineno}: multiple spaces before inline comment")
 
-    reader   = SimpleYAMLReader(key_types)
+    reader = SimpleYAMLReader(key_types)
     try:
         data = reader.parse(text)
     except Exception as exc:
@@ -613,26 +630,23 @@ def validate_config(config_path: Path, key_types: dict) -> list[str]:
 
     for key in data:
         if key not in key_types and key != IDLE_STATUS_KEY:
-            issues.append(f"Unknown top-level key '{key}' (not in current template)")
+            issues.append(f"Key '{key}' not found in current upstream template (may have been removed)")
 
     return issues
 
 
 # ──────────────────────────────────────────────────────────────
-# Config merger  — inject user values into the fresh template
+# Config merger
 # ──────────────────────────────────────────────────────────────
 
 def _render_list(items: list, indent: str = "  ") -> str:
-    out = []
-    for entry in dedup_list(items):
-        out.append(f"{indent}- {entry.val}")
-    return "\n".join(out)
+    return "\n".join(f"{indent}- {e.val}" for e in dedup_list(items))
 
 
 def _render_map(mapping: dict, parent_key: str, indent: str = "  ") -> str:
     out = []
     for k, v in dedup_map(mapping).items():
-        if isinstance(v, list):   # map-of-lists
+        if isinstance(v, list):
             out.append(f"{indent}{k}:")
             for sub in v:
                 out.append(f"{indent}  - {sub.val}")
@@ -642,17 +656,10 @@ def _render_map(mapping: dict, parent_key: str, indent: str = "  ") -> str:
 
 
 def _render_submap(submap: dict, indent: str = "  ") -> str:
-    out = []
-    for k, v in submap.items():
-        out.append(f"{indent}{k}: {v}")
-    return "\n".join(out)
+    return "\n".join(f"{indent}{k}: {v}" for k, v in submap.items())
 
 
 def merge_config(template_yaml: str, user_data: dict, key_types: dict) -> str:
-    """
-    Walk the template line-by-line, replacing empty-block placeholders with
-    the user's carried-over values. Returns the merged YAML string.
-    """
     out_lines = []
     lines = template_yaml.splitlines()
     i = 0
@@ -662,7 +669,6 @@ def merge_config(template_yaml: str, user_data: dict, key_types: dict) -> str:
         line = lines[i]
         stripped = line.strip()
 
-        # Comment or blank — pass through
         if not stripped or stripped.startswith("#"):
             out_lines.append(line.rstrip())
             i += 1
@@ -678,11 +684,10 @@ def merge_config(template_yaml: str, user_data: dict, key_types: dict) -> str:
         value = m.group(2).strip()
         ktype = key_types.get(key, TYPE_UNKNOWN)
 
-        # ── Scalar key: emit with user's value ──────────────
+        # ── Scalar ──────────────────────────────────────────
         if value and not value.startswith("#"):
             user_val = user_data.get(key)
             if isinstance(user_val, str) and user_val:
-                # Normalise spacing around inline comment
                 uv = user_val.strip()
                 mv = re.match(r'^([^#]+?)\s*(#.*)?$', uv)
                 if mv:
@@ -692,34 +697,22 @@ def merge_config(template_yaml: str, user_data: dict, key_types: dict) -> str:
                 out_lines.append(f"{key}: {uv}")
             else:
                 out_lines.append(f"{key}: {value}")
-            # Skip original indented block in template (shouldn't exist for scalars)
             i += 1
             continue
 
-        # ── Block key (list / map / submap / unknown) ────────
+        # ── Block key ───────────────────────────────────────
         out_lines.append(f"{key}:")
 
         # Skip template's own child lines for this key
         i += 1
-        while i < n and (lines[i].startswith("  ") or not lines[i].strip() and i + 1 < n and lines[i + 1].startswith("  ")):
-            # Only skip indented children, not blank lines before next top-level key
-            if lines[i].startswith("  "):
-                i += 1
-            else:
-                break
+        while i < n and lines[i].startswith("  "):
+            i += 1
 
-        # Emit user's values
         user_val = user_data.get(key)
 
         if key == IDLE_STATUS_KEY or ktype == TYPE_SUBMAP:
             if isinstance(user_val, dict) and user_val:
                 out_lines.append(_render_submap(user_val))
-            else:
-                # Use template defaults for the submap
-                # Re-read template submap
-                j = i
-                # Actually we already skipped past those lines; fall back to defaults
-                pass  # will be empty — that's fine, SLSsteam handles missing sub-keys
 
         elif ktype == TYPE_LIST or (ktype == TYPE_UNKNOWN and isinstance(user_val, list)):
             if isinstance(user_val, list) and user_val:
@@ -729,7 +722,7 @@ def merge_config(template_yaml: str, user_data: dict, key_types: dict) -> str:
             if isinstance(user_val, dict) and user_val:
                 out_lines.append(_render_map(user_val, key))
 
-        # else: empty block — leave just `key:` with no children
+        # else: empty → just `key:` with no children
 
     return "\n".join(out_lines) + "\n"
 
@@ -739,11 +732,6 @@ def merge_config(template_yaml: str, user_data: dict, key_types: dict) -> str:
 # ──────────────────────────────────────────────────────────────
 
 def make_backup_with_rotation(config_path: Path) -> Path:
-    """
-    Creates a backup of config.yaml with rotation.
-    Tries config.yaml.bak, config.yaml.bak2, config.yaml.bak3, etc.
-    Returns the backup path created.
-    """
     bak_base = config_path.with_name(config_path.name + ".bak")
     if not bak_base.exists():
         shutil.copy2(config_path, bak_base)
@@ -764,8 +752,7 @@ def make_backup_with_rotation(config_path: Path) -> Path:
 def run_asshead_migration(
     config_path: Path,
     template_url: str = TEMPLATE_SOURCE_URL,
-    hints_url: str    = KEY_HINTS_URL,
-) -> tuple[bool, str, Optional[Path]]:
+) -> tuple:
     """
     Validates and migrates config.yaml to the latest upstream template.
     Creates a rotating backup if changes are needed.
@@ -775,17 +762,19 @@ def run_asshead_migration(
         if not config_path.exists():
             return False, f"Config file not found at {config_path}", None
 
-        hints        = fetch_key_hints(hints_url)
-        template_yaml = fetch_template(template_url)
-        key_types    = infer_key_types(template_yaml, hints)
+        raw_hpp       = _fetch_url(template_url, TEMPLATE_TIMEOUT)
+        key_types     = infer_key_types(raw_hpp)
 
-        config_text = config_path.read_text(encoding="utf-8")
-        reader      = SimpleYAMLReader(key_types)
-        old_data    = reader.parse(config_text)
+        m = re.search(r'static const char\* defaultConfig = R"\((.+?)\)";', raw_hpp, re.DOTALL)
+        template_yaml = m.group(1) if m else ""
 
+        config_text   = config_path.read_text(encoding="utf-8")
+        reader        = SimpleYAMLReader(key_types)
+        old_data      = reader.parse(config_text)
         template_data = reader.parse(template_yaml)
-        issues        = validate_config(config_path, key_types)
-        new_keys      = set(template_data) - set(old_data)
+
+        issues   = validate_config(config_path, key_types)
+        new_keys = set(template_data) - set(old_data)
 
         if not issues and not new_keys:
             return True, "No changes needed. SLSsteam config is already optimal!", None
@@ -819,6 +808,9 @@ def main() -> None:
             Fetches the latest upstream template and carries over all your
             personal values into the new structure, fixing formatting issues
             and adding any new keys with their default values.
+
+            Key types are inferred automatically from the template — no manual
+            updates needed when the SLSsteam developer adds or removes keys.
         """),
         epilog=textwrap.dedent("""\
             Examples:
@@ -855,15 +847,10 @@ def main() -> None:
         "--template-url", default=TEMPLATE_SOURCE_URL,
         help="Override the GitHub URL for the default config template",
     )
-    parser.add_argument(
-        "--hints-url", default=KEY_HINTS_URL,
-        help="Override the GitHub URL for the key-type hints JSON",
-    )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
 
     args = parser.parse_args()
 
-    # Interactive mode: no CLI flags were passed by the user
     interactive = (
         args.config        == DEFAULT_CONFIG_PATH
         and args.output    is None
@@ -872,7 +859,6 @@ def main() -> None:
         and not args.validate_only
         and not args.no_resolve_names
         and args.template_url == TEMPLATE_SOURCE_URL
-        and args.hints_url    == KEY_HINTS_URL
     )
 
     print()
@@ -932,7 +918,7 @@ def main() -> None:
         print()
         return
 
-    # ── Options 1/3: resolve config path ─────────────────────────
+    # ── Resolve config path ───────────────────────────────────────
     if interactive:
         print(f"Default config location: {DEFAULT_CONFIG_PATH}")
         while True:
@@ -958,11 +944,25 @@ def main() -> None:
     print()
 
     # ── Fetch template and infer key types ───────────────────────
-    print(f"{BOLD}[0/4] Fetching key hints and template from GitHub…{RESET}")
-    hints         = fetch_key_hints(args.hints_url)
-    template_yaml = fetch_template(args.template_url)
-    key_types     = infer_key_types(template_yaml, hints)
+    print(f"{BOLD}[0/4] Fetching and analysing upstream template…{RESET}")
+    try:
+        raw_hpp = _fetch_url(args.template_url, TEMPLATE_TIMEOUT)
+    except Exception as exc:
+        error(f"Failed to fetch template: {exc}")
+        sys.exit(1)
+
+    key_types = infer_key_types(raw_hpp)
+
+    m_tmpl = re.search(r'static const char\* defaultConfig = R"\((.+?)\)";', raw_hpp, re.DOTALL)
+    if not m_tmpl:
+        error("Could not find YAML template in the downloaded C++ file.")
+        sys.exit(1)
+    template_yaml = m_tmpl.group(1)
+
     ok(f"  Discovered {len(key_types)} top-level key(s) in upstream template.")
+    unknown = [k for k, t in key_types.items() if t == TYPE_UNKNOWN]
+    if unknown:
+        info(f"  Keys with auto-detected type (from your config): {', '.join(unknown)}")
     print()
 
     # ── 1. Validate ──────────────────────────────────────────────
@@ -1003,7 +1003,7 @@ def main() -> None:
         resolve_missing_names(old_data)
     print()
 
-    # ── 2.5 Steam Deck preset (option 3) ─────────────────────────
+    # ── 2.5 Steam Deck preset ────────────────────────────────────
     if interactive and choice == 3:
         info("Applying Steam Deck recommended overrides:")
         overrides = {
@@ -1017,7 +1017,7 @@ def main() -> None:
             old_data[k] = v
         print()
 
-    # ── 3. Fetch template data ────────────────────────────────────
+    # ── 3. Compare ───────────────────────────────────────────────
     print(f"{BOLD}[3/4] Comparing with upstream template…{RESET}")
     template_data = reader.parse(template_yaml)
     new_keys      = set(template_data) - set(old_data)
@@ -1034,7 +1034,7 @@ def main() -> None:
     print(f"{BOLD}[4/4] Merging your values into new template…{RESET}")
     merged = merge_config(template_yaml, old_data, key_types)
 
-    for key in list(key_types.keys()):
+    for key in key_types:
         old_val = old_data.get(key)
         if isinstance(old_val, dict):
             before, after = len(old_val), len(dedup_map(old_val))
