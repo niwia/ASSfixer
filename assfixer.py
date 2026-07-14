@@ -23,12 +23,14 @@ Usage:
     python3 slssteam_config.py [OPTIONS]
 
 Options:
-    --config PATH       Path to config.yaml (default: ~/.config/SLSsteam/config.yaml)
-    --output PATH       Where to write the result (default: overwrites --config after backup)
-    --dry-run           Print result to stdout, don't write to disk
-    --no-backup         Skip creating a .bak backup before writing
-    --validate-only     Only check for errors in your current config, don't write
-    --template-url URL  Override the GitHub raw URL for the default config template
+    --config PATH         Path to config.yaml (default: auto-detected)
+    --output PATH         Where to write the result (default: overwrites --config after backup)
+    --dry-run             Print result to stdout, don't write to disk
+    --no-backup           Skip creating a .bck backup before writing
+    --validate-only       Only check for errors in your current config, don't write
+    --no-resolve-names    Skip outbound SteamCMD API calls for game name resolution
+    --template-url URL    Override the GitHub raw URL for the default config template
+    --version             Show version and exit
 """
 
 import argparse
@@ -38,24 +40,115 @@ import shutil
 import sys
 import textwrap
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional, List, Dict, Tuple, Set
 
 # ──────────────────────────────────────────────────────────────
-# Constants
+# Version
 # ──────────────────────────────────────────────────────────────
 
-FLATPAK_CONFIG_PATH = Path.home() / ".var" / "app" / "com.valvesoftware.Steam" / ".config" / "SLSsteam" / "config.yaml"
-NATIVE_CONFIG_PATH = Path.home() / ".config" / "SLSsteam" / "config.yaml"
+VERSION = "2.0.0"
+
+boot_status = None
+boot_issues = []
+
+def run_boot_config_check() -> None:
+    """
+    Checks the SLSsteam config once in a background thread and updates global status.
+    Uses DEFAULT_CONFIG_PATH.
+    """
+    global boot_status, boot_issues
+    if boot_status is not None and boot_status != "checking":
+        return  # Already run or running
+
+    boot_status = "checking"
+    try:
+        config_path = DEFAULT_CONFIG_PATH
+        if not config_path.exists():
+            boot_status = "no_config"
+            return
+
+        # Validate local config structure first
+        issues = validate_config(config_path)
+
+        # Try to download template to check for missing upstream keys.
+        # If the network is unavailable, we still report the local validation result
+        # rather than marking the whole check as failed.
+        new_keys = set()
+        try:
+            template_yaml = fetch_template(TEMPLATE_SOURCE_URL)
+            reader = SimpleYAMLReader()
+            old_data = reader.parse(config_path.read_text(encoding="utf-8"))
+            template_data = reader.parse(template_yaml)
+            new_keys = set(template_data) - set(old_data)
+        except Exception as net_err:
+            # Network unavailable or GitHub unreachable — skip upstream key check
+            boot_issues = [f"[Network] Could not fetch template: {net_err}"]
+            # Still report based purely on local validation
+            if issues:
+                boot_status = "needs_fix"
+                boot_issues = issues[:]
+            else:
+                boot_status = "optimal"
+            return
+
+        if issues or new_keys:
+            boot_status = "needs_fix"
+            boot_issues = issues[:]
+            if new_keys:
+                boot_issues.append(f"Missing {len(new_keys)} upstream default key(s).")
+        else:
+            boot_status = "optimal"
+    except Exception as e:
+        boot_status = "failed"
+        boot_issues = [str(e)]
+
+# ──────────────────────────────────────────────────────────────
+# Path / URL constants
+# ──────────────────────────────────────────────────────────────
+
+FLATPAK_CONFIG_PATH = (
+    Path.home() / ".var" / "app" / "com.valvesoftware.Steam"
+    / ".config" / "SLSsteam" / "config.yaml"
+)
+NATIVE_CONFIG_PATH  = Path.home() / ".config" / "SLSsteam" / "config.yaml"
 DEFAULT_CONFIG_PATH = FLATPAK_CONFIG_PATH if FLATPAK_CONFIG_PATH.exists() else NATIVE_CONFIG_PATH
 
-# The C++ source file that contains the YAML default template as a raw string literal.
-# Fetching this directly always gives us the latest upstream template.
+# C++ source that embeds the YAML default template as a raw string literal.
 TEMPLATE_SOURCE_URL = (
     "https://raw.githubusercontent.com/AceSLS/SLSsteam/main/src/config_default.hpp"
 )
 
+TEMPLATE_TIMEOUT  = 15   # seconds – GitHub raw file download
+STEAM_API_TIMEOUT =  5   # seconds – per-game name lookups (many in parallel)
+
 # ──────────────────────────────────────────────────────────────
-# Colours for terminal output
+# Key-set constants  (defined here, before SimpleYAMLReader)
+# ──────────────────────────────────────────────────────────────
+
+SCALAR_KEYS = {
+    "DisableFamilyShareLock", "UseWhitelist", "AutoFilterList",
+    "PlayNotOwnedGames", "SafeMode", "Notifications", "WarnHashMissmatch",
+    "NotifyInit", "API", "DisableCloud", "FakeEmail", "FakeWalletBalance",
+    "LogLevel", "ExtendedLogging", "MaxSchemaTries", "DisableUpdates",
+}
+# All scalar keys that take yes/no values
+BOOLEAN_KEYS = SCALAR_KEYS - {"FakeEmail", "FakeWalletBalance", "LogLevel"}
+
+LIST_KEYS        = {"AppIds", "AdditionalApps", "FakeOffline", "DepotBlacklist"}
+MAP_KEYS         = {"AppTokens", "FakeAppIds", "GameTitles", "SubscriptionTimestamps", "DlcData", "ManifestIds"}
+MAP_OF_LIST_KEYS = {"DenuvoGames"}
+IDLE_STATUS_KEY  = "IdleStatus"
+
+KNOWN_KEYS = (
+    SCALAR_KEYS | LIST_KEYS | MAP_KEYS | MAP_OF_LIST_KEYS
+    | {IDLE_STATUS_KEY, "UnownedStatus"}
+)
+
+# ──────────────────────────────────────────────────────────────
+# Colours / logging helpers
 # ──────────────────────────────────────────────────────────────
 
 RED    = "\033[91m"
@@ -70,40 +163,26 @@ def ok(msg):    print(f"{GREEN}[OK]{RESET}    {msg}")
 def warn(msg):  print(f"{YELLOW}[WARN]{RESET}  {msg}")
 def error(msg): print(f"{RED}[ERROR]{RESET} {msg}", file=sys.stderr)
 
-
 # ──────────────────────────────────────────────────────────────
-# Formatting helpers
+# Formatting / sanitization helpers
 # ──────────────────────────────────────────────────────────────
 
 def normalize_comment_spacing(raw: str) -> str:
     """
     Normalize whitespace between a value and its trailing inline comment.
 
-    Input:  '480   # Webfishing'      or  '237990 # The Banner Saga'
-    Output: '480 # Webfishing'            '237990 # The Banner Saga'
-
+    '480   # Webfishing'  →  '480 # Webfishing'
     Quoted strings are left untouched.
     """
     s = raw.strip()
-    if not s:
+    if not s or s.startswith('"') or s.startswith("'"):
         return s
-    # Don't touch quoted values
-    if s.startswith('"') or s.startswith("'"):
-        return s
-    # Match: <non-space-value>  <optional spaces>  # comment
     m = re.match(r'^(\S+)\s+(#.*)$', s)
-    if m:
-        return f"{m.group(1)} {m.group(2)}"
-    return s
+    return f"{m.group(1)} {m.group(2)}" if m else s
 
 
 def bare_value(raw: str) -> str:
-    """
-    Return only the value part (no inline comment) for deduplication purposes.
-    e.g.  '237990 # The Banner Saga'  →  '237990'
-          '480 # Webfishing'           →  '480'
-          '"some text"'                →  '"some text"'
-    """
+    """Return only the value part (no inline comment) for deduplication."""
     s = raw.strip()
     if s.startswith('"') or s.startswith("'"):
         return s
@@ -112,38 +191,21 @@ def bare_value(raw: str) -> str:
 
 
 def sanitize_title(title: str) -> str:
-    """
-    Sanitize the Title/String value to ensure it is properly quoted.
-    If it is unclosed or malformed (like `Title: " ;`), we fix it.
-    """
+    """Ensure a Title/String value is properly double-quoted."""
     title = title.strip()
     if not title:
         return '""'
-    
-    # Check if it is correctly wrapped in double quotes
     if title.startswith('"') and title.endswith('"') and len(title) >= 2:
         return title
-        
-    # Check if it is correctly wrapped in single quotes
     if title.startswith("'") and title.endswith("'") and len(title) >= 2:
         return title
-        
-    # Strip any leading/trailing quotes and clean
     cleaned = title.strip('"').strip("'").strip()
-    
-    # If the cleaned title is empty or just stray characters (like C++ comment/semicolon remnants), return ""
-    if cleaned in ("", ";"):
-        return '""'
-        
-    # Otherwise wrap in double quotes
-    return f'"{cleaned}"'
+    return '""' if cleaned in ("", ";") else f'"{cleaned}"'
 
 
 def sanitize_boolean(val: str, default: str) -> str:
     """Normalize boolean strings to 'yes' or 'no'."""
-    if not val:
-        return default
-    v = val.strip().lower()
+    v = (val or "").strip().lower()
     if v in ("yes", "true", "1", "y", "on"):
         return "yes"
     if v in ("no", "false", "0", "n", "off"):
@@ -152,95 +214,59 @@ def sanitize_boolean(val: str, default: str) -> str:
 
 
 def sanitize_log_level(val: str, default: str) -> str:
-    """LogLevel must be an integer between 0 and 6 inclusive."""
-    if not val:
-        return default
-    v = val.strip()
-    if v.isdigit() and 0 <= int(v) <= 6:
-        return v
-    return default
+    """LogLevel must be an integer 0–6."""
+    v = (val or "").strip()
+    return v if v.isdigit() and 0 <= int(v) <= 6 else default
 
 
 def sanitize_wallet_balance(val: str, default: str) -> str:
     """FakeWalletBalance must be a non-negative integer."""
-    if not val:
-        return default
-    v = val.strip()
-    if v.isdigit():
-        return v
-    return default
+    v = (val or "").strip()
+    return v if v.isdigit() else default
 
 
 # ──────────────────────────────────────────────────────────────
-# Fetch + extract the template YAML from GitHub
+# ConfigEntry  (dataclass replaces manual __slots__)
 # ──────────────────────────────────────────────────────────────
 
-def fetch_template(url: str) -> str:
+@dataclass
+class ConfigEntry:
     """
-    Download config_default.hpp and extract the YAML string from between the
-    R\"(  )\" raw-string delimiters in the C++ source.
+    One parsed entry from a raw list or mapping line.
+
+    list item:  '  - 237990 # The Banner Saga'
+      → key = None,     raw_value = '237990 # The Banner Saga'
+
+    map item:   '  3146520: 480 # Webfishing'
+      → key = '3146520', raw_value = '480 # Webfishing'
     """
-    info(f"Fetching latest template from:\n        {url}")
-    try:
-        with urllib.request.urlopen(url, timeout=15) as resp:
-            source = resp.read().decode("utf-8", errors="replace")
-    except Exception as exc:
-        error(f"Failed to download template: {exc}")
-        sys.exit(1)
+    key:       str | None
+    raw_value: str
 
-    # static const char* defaultConfig = R"( ... )";
-    match = re.search(r'= R"\((.+?)\)";', source, re.DOTALL)
-    if not match:
-        error("Could not find the YAML template inside config_default.hpp!")
-        error("The upstream file format may have changed. Check the URL.")
-        sys.exit(1)
+    def __post_init__(self):
+        self.raw_value = normalize_comment_spacing(self.raw_value)
 
-    yaml_text = match.group(1)
-    ok("Template fetched successfully.")
-    return yaml_text
+    @property
+    def dedup_key(self) -> str:
+        """Value without inline comment — used for list deduplication."""
+        return bare_value(self.raw_value)
 
 
 # ──────────────────────────────────────────────────────────────
 # Config parser  (zero external dependencies)
 # ──────────────────────────────────────────────────────────────
 
-class ConfigEntry:
-    """
-    Stores one parsed entry from a raw list or mapping line,
-    keeping the full text including any inline comment.
-
-    Examples:
-      list item:    '  - 237990 # The Banner Saga'
-        → raw_value = '237990 # The Banner Saga'
-        → key        = None
-
-      map item:     '  3146520: 480   # Webfishing'
-        → raw_value = '480 # Webfishing'  (normalized spacing)
-        → key        = '3146520'
-    """
-    __slots__ = ("key", "raw_value")
-
-    def __init__(self, key, raw_value: str):
-        self.key = key
-        self.raw_value = normalize_comment_spacing(raw_value)
-
-    @property
-    def dedup_key(self) -> str:
-        """Value without comment, used for list deduplication."""
-        return bare_value(self.raw_value)
-
-
 class SimpleYAMLReader:
     """
-    Parses the specific structure that SLSsteam's config.yaml uses.
+    Parses the specific YAML structure that SLSsteam's config.yaml uses.
 
     Returns a dict mapping top-level key names to one of:
-      None                – empty key (no children)
-      str                 – scalar  (DisableFamilyShareLock, LogLevel, …)
-      list[ConfigEntry]   – list    (AppIds, AdditionalApps, FakeOffline)
-      dict[str, ConfigEntry] – map  (FakeAppIds, AppTokens, GameTitles, …)
+      None                       – empty key (no children)
+      str                        – scalar
+      list[ConfigEntry]          – list    (AppIds, AdditionalApps, FakeOffline)
+      dict[str, ConfigEntry]     – map     (FakeAppIds, AppTokens, GameTitles, …)
       dict[str, list[ConfigEntry]] – map-of-lists  (DenuvoGames)
-      dict                – IdleStatus sub-map with plain str values
+      dict[str, str]             – IdleStatus / UnownedStatus sub-map
     """
 
     # ── Top-level parse ──────────────────────────────────────────
@@ -251,7 +277,7 @@ class SimpleYAMLReader:
         n = len(lines)
 
         while i < n:
-            line = lines[i]
+            line     = lines[i]
             stripped = line.strip()
 
             if not stripped or stripped.startswith("#"):
@@ -263,15 +289,13 @@ class SimpleYAMLReader:
                 i += 1
                 continue
 
-            key   = m.group(1)
-            rest  = m.group(2).strip()
+            key  = m.group(1)
+            rest = m.group(2).strip()
 
-            # Strip inline comment from scalar values only
-            # (not from list/map children — those we handle separately)
             rest_clean = self._strip_scalar_comment(rest)
 
             if rest_clean:
-                # Scalar on the same line
+                # Value is on the same line as the key
                 if key in LIST_KEYS:
                     data[key] = self._parse_scalar_as_list(rest)
                 elif key in MAP_KEYS or key in MAP_OF_LIST_KEYS:
@@ -282,103 +306,96 @@ class SimpleYAMLReader:
                     data[key] = rest_clean
                 i += 1
             else:
-                # Collect child lines.
-                # Stop at blank lines, or when encountering a known top-level key.
+                # Collect indented child lines
                 i += 1
                 children = []
                 while i < n:
                     child = lines[i]
-                    cs = child.strip()
-                    # Blank line → end of this section's children
+                    cs    = child.strip()
                     if not cs:
                         break
-                    # Comment-only line inside children → skip but keep going
                     if cs.startswith("#"):
                         i += 1
                         continue
-
-                    # Check if the line is a known top-level key
                     m_top = re.match(r'^([A-Za-z][A-Za-z0-9_]*):\s*(.*)', child)
                     if m_top and m_top.group(1) in KNOWN_KEYS:
-                        # Valid next top-level key, stop collecting children
                         break
-
-                    # Collect this line as a child (indented or not, we will filter out junk in _parse_children)
                     children.append(child)
                     i += 1
 
-                if not children:
-                    data[key] = None
-                else:
-                    data[key] = self._parse_children(key, children)
+                data[key] = self._parse_children(key, children) if children else None
 
         return data
 
-    # ── Scalar helpers ───────────────────────────────────────────
+    # ── Scalar comment stripper ──────────────────────────────────
     def _strip_scalar_comment(self, s: str) -> str:
-        """Strip trailing # comment from a scalar, respecting quotes."""
-        if not s:
-            return s
-        if s.startswith('"') or s.startswith("'"):
+        if not s or s.startswith('"') or s.startswith("'"):
             return s
         idx = s.find(" #")
-        if idx >= 0:
-            return s[:idx].strip()
-        return s.strip()
+        return s[:idx].strip() if idx >= 0 else s.strip()
 
-    # ── Child block parse ────────────────────────────────────────
+    # ── Child block dispatcher ───────────────────────────────────
     def _parse_children(self, parent_key: str, lines: list) -> object:
-        """
-        Detect whether children form a list, a mapping, or a mapping-of-lists,
-        and return the appropriate structure with full raw values preserved.
-        """
+        """Route child lines to the appropriate sub-parser."""
         stripped = [l.strip() for l in lines]
-
-        # ── List Keys ───────────────────────────────────────────
         if parent_key in LIST_KEYS:
-            result_list = []
-            for s in stripped:
-                if s.startswith("- ") or s == "-":
-                    val = s[2:].strip() if s.startswith("- ") else ""
-                else:
-                    val = s.strip()
-                if not val:
-                    continue
-                # Enforce rule: item must start with a positive integer, optional comment
-                m = re.match(r'^([0-9]+)\s*(#.*)?$', val)
-                if m:
-                    num = m.group(1)
-                    comment = m.group(2)
-                    raw_val = f"{num} {comment.strip()}" if comment else num
-                    result_list.append(ConfigEntry(None, raw_val))
-            return result_list
-
-        # ── IdleStatus / UnownedStatus ──────────────────────────
+            return self._parse_list_children(stripped)
         if parent_key in (IDLE_STATUS_KEY, "UnownedStatus"):
-            result = {}
-            for s in stripped:
-                mm = re.match(r'^([A-Za-z][A-Za-z0-9_]*):\s*(.*)', s)
-                if mm:
-                    k = mm.group(1)
-                    val = mm.group(2).strip()
-                    if k == "AppId":
-                        if val.isdigit():
-                            result[k] = val
-                        else:
-                            result[k] = "0"
-                    elif k == "Title":
-                        result[k] = sanitize_title(val)
-            if "AppId" not in result:
-                result["AppId"] = "0"
-            if "Title" not in result:
-                result["Title"] = '""'
-            return result
+            return self._parse_submap_children(stripped)
+        return self._parse_map_children(parent_key, lines, stripped)
 
-        # ── Mapping (k: v) or mapping-of-lists ──────────────────
+    # ── List children ────────────────────────────────────────────
+    def _parse_list_children(self, stripped: list[str]) -> list:
+        """Parse '  - <appid> [# comment]' lines into ConfigEntry list."""
+        result = []
+        for s in stripped:
+            if s.startswith("- "):
+                val = s[2:].strip()
+            elif s == "-":
+                continue          # bare dash with no value → skip
+            else:
+                val = s.strip()   # non-dash line: try anyway
+
+            if not val:
+                continue
+            m = re.match(r'^([0-9]+)\s*(#.*)?$', val)
+            if m:
+                num     = m.group(1)
+                comment = m.group(2)
+                raw_val = f"{num} {comment.strip()}" if comment else num
+                result.append(ConfigEntry(None, raw_val))
+        return result
+
+    # ── IdleStatus / UnownedStatus children ──────────────────────
+    def _parse_submap_children(self, stripped: list[str]) -> dict:
+        """Parse the two-field AppId/Title sub-map."""
+        result = {}
+        for s in stripped:
+            mm = re.match(r'^([A-Za-z][A-Za-z0-9_]*):\s*(.*)', s)
+            if not mm:
+                continue
+            k   = mm.group(1)
+            val = mm.group(2).strip()
+            if k == "AppId":
+                result[k] = val if val.isdigit() else "0"
+            elif k == "Title":
+                result[k] = sanitize_title(val)
+        result.setdefault("AppId", "0")
+        result.setdefault("Title", '""')
+        return result
+
+    # ── Mapping children (MAP_KEYS + MAP_OF_LIST_KEYS) ──────────
+    def _parse_map_children(
+        self, parent_key: str, lines: list[str], stripped: list[str]
+    ) -> dict:
+        """
+        Parse '<appid>: <value>' lines, and optionally sub-lists under a bare key.
+        Non-numeric keys are warned about and skipped.
+        """
         result_map: dict = {}
         i = 0
         while i < len(lines):
-            s = stripped[i]
+            s  = stripped[i]
             mm = re.match(r'^([^:]+):\s*(.*)', s)
             if not mm:
                 i += 1
@@ -387,42 +404,30 @@ class SimpleYAMLReader:
             k   = mm.group(1).strip()
             val = mm.group(2).strip()
 
-            # For mapping keys or mapping-of-lists keys, the keys must be numeric digits (AppIds/SteamIds)
             if not k.isdigit():
+                warn(
+                    f"Skipping non-numeric map key '{k}' under '{parent_key}'"
+                    f" — expected a Steam App ID; check your config for typos"
+                )
                 i += 1
                 continue
 
             if val:
-                # k: val
-                cleaned_val = ""
-                m = re.match(r'^([^#\s]+)\s*(#.*)?$', val)
-                if m:
-                    v_part = m.group(1).strip()
-                    comment = m.group(2)
-                    
-                    if parent_key in ("AppTokens", "FakeAppIds", "SubscriptionTimestamps"):
-                        if v_part.isdigit():
-                            cleaned_val = f"{v_part} {comment.strip()}" if comment else v_part
-                    elif parent_key == "GameTitles":
-                        v_quoted = sanitize_title(v_part)
-                        cleaned_val = f"{v_quoted} {comment.strip()}" if comment else v_quoted
-                    else:
-                        cleaned_val = val
-                
-                if cleaned_val:
-                    result_map[k] = ConfigEntry(k, cleaned_val)
+                cleaned = self._clean_map_value(parent_key, val)
+                if cleaned:
+                    result_map[k] = ConfigEntry(k, cleaned)
                 i += 1
             else:
-                # k: (null) — look ahead for sub-list items
+                # Bare key → look ahead for '  - <appid>' sub-list
                 i += 1
                 sub = []
                 while i < len(lines):
                     ss = stripped[i]
                     if ss.startswith("- "):
                         sub_val = ss[2:].strip()
-                        m_sub = re.match(r'^([0-9]+)\s*(#.*)?$', sub_val)
+                        m_sub   = re.match(r'^([0-9]+)\s*(#.*)?$', sub_val)
                         if m_sub:
-                            num = m_sub.group(1)
+                            num     = m_sub.group(1)
                             comment = m_sub.group(2)
                             raw_sub = f"{num} {comment.strip()}" if comment else num
                             sub.append(ConfigEntry(None, raw_sub))
@@ -433,69 +438,58 @@ class SimpleYAMLReader:
 
         return result_map
 
+    def _clean_map_value(self, parent_key: str, val: str) -> str:
+        """Sanitize a mapping entry's value string; return '' to discard."""
+        m = re.match(r'^([^#\s]+)\s*(#.*)?$', val)
+        if not m:
+            return ""
+        v_part  = m.group(1).strip()
+        comment = m.group(2)
+        if parent_key in ("AppTokens", "FakeAppIds", "SubscriptionTimestamps", "ManifestIds"):
+            if not v_part.isdigit():
+                return ""
+            return f"{v_part} {comment.strip()}" if comment else v_part
+        if parent_key == "GameTitles":
+            v_quoted = sanitize_title(v_part)
+            return f"{v_quoted} {comment.strip()}" if comment else v_quoted
+        return val
+
+    # ── Scalar-encoded structures ─────────────────────────────────
     def _parse_scalar_as_list(self, val: str) -> list:
-        val = val.strip()
-        if not val:
-            return []
-        if val.startswith("[") and val.endswith("]"):
-            val = val[1:-1].strip()
-        parts = [p.strip() for p in val.split(",")]
+        val = val.strip().strip("[]")
         result = []
-        for part in parts:
-            if not part:
-                continue
-            m = re.match(r'^([0-9]+)\s*(#.*)?$', part)
+        for part in val.split(","):
+            part = part.strip()
+            m    = re.match(r'^([0-9]+)\s*(#.*)?$', part)
             if m:
-                num = m.group(1)
-                comment = m.group(2)
+                num, comment = m.group(1), m.group(2)
                 raw_val = f"{num} {comment.strip()}" if comment else num
                 result.append(ConfigEntry(None, raw_val))
         return result
 
     def _parse_scalar_as_map(self, parent_key: str, val: str) -> dict:
-        val = val.strip()
-        if not val:
-            return {}
-        if val.startswith("{") and val.endswith("}"):
-            val = val[1:-1].strip()
-        parts = [p.strip() for p in val.split(",")]
+        val    = val.strip().strip("{}")
         result = {}
-        for part in parts:
-            mm = re.match(r'^([^:]+):\s*(.*)', part)
-            if mm:
-                k = mm.group(1).strip()
-                v = mm.group(2).strip()
-                if k.isdigit():
-                    cleaned_val = ""
-                    m = re.match(r'^([^#\s]+)\s*(#.*)?$', v)
-                    if m:
-                        v_part = m.group(1).strip()
-                        comment = m.group(2)
-                        if parent_key in ("AppTokens", "FakeAppIds", "SubscriptionTimestamps"):
-                            if v_part.isdigit():
-                                cleaned_val = f"{v_part} {comment.strip()}" if comment else v_part
-                        elif parent_key == "GameTitles":
-                            v_quoted = sanitize_title(v_part)
-                            cleaned_val = f"{v_quoted} {comment.strip()}" if comment else v_quoted
-                        else:
-                            cleaned_val = v
-                    if cleaned_val:
-                        result[k] = ConfigEntry(k, cleaned_val)
+        for part in val.split(","):
+            part = part.strip()
+            mm   = re.match(r'^([^:]+):\s*(.*)', part)
+            if not mm:
+                continue
+            k = mm.group(1).strip()
+            v = mm.group(2).strip()
+            if not k.isdigit():
+                continue
+            cleaned = self._clean_map_value(parent_key, v)
+            if cleaned:
+                result[k] = ConfigEntry(k, cleaned)
         return result
 
     def _parse_scalar_as_submap(self, val: str) -> dict:
-        val = val.strip()
-        result = {}
+        result  = {}
         m_appid = re.search(r'AppId:\s*([0-9]+)', val)
-        if m_appid:
-            result["AppId"] = m_appid.group(1)
-        m_title = re.search(r'Title:\s*(.*)', val)
-        if m_title:
-            result["Title"] = sanitize_title(m_title.group(1))
-        if "AppId" not in result:
-            result["AppId"] = "0"
-        if "Title" not in result:
-            result["Title"] = '""'
+        m_title = re.search(r'Title:\s*(.*)',       val)
+        result["AppId"]  = m_appid.group(1) if m_appid else "0"
+        result["Title"] = sanitize_title(m_title.group(1)) if m_title else '""'
         return result
 
 
@@ -503,60 +497,49 @@ class SimpleYAMLReader:
 # Validation
 # ──────────────────────────────────────────────────────────────
 
-
-def validate_config(config_path: Path) -> list:
-    """
-    Scan the config for common formatting issues.
-    Returns a list of human-readable warning strings.
-    """
-    issues = []
+def validate_config(config_path: Path) -> list[str]:
+    """Scan the raw config for common formatting issues. Returns warning strings."""
     try:
         text = config_path.read_text(encoding="utf-8")
     except Exception as exc:
         return [f"Cannot read file: {exc}"]
 
-    lines = text.splitlines()
+    issues:    list[str] = []
+    seen_keys: dict      = {}
 
-    for lineno, raw in enumerate(lines, 1):
+    for lineno, raw in enumerate(text.splitlines(), 1):
         stripped = raw.strip()
         if not stripped or stripped.startswith("#"):
             continue
 
         if "\t" in raw:
-            issues.append(f"Line {lineno}: Contains TAB character (YAML requires spaces)")
-
+            issues.append(f"Line {lineno}: TAB character (YAML requires spaces)")
         if raw.endswith("\r"):
             issues.append(f"Line {lineno}: Windows-style CRLF line ending")
-
         if re.match(r'^[A-Za-z][A-Za-z0-9_]*:[^ \n]', raw):
             issues.append(f"Line {lineno}: Missing space after colon  →  '{raw.rstrip()}'")
-
         if raw != raw.rstrip():
             issues.append(f"Line {lineno}: Trailing whitespace")
-
         if re.match(r'^\s+-[^ ]', raw) and not re.match(r'^\s+- ', raw):
             issues.append(f"Line {lineno}: List item missing space after dash  →  '{raw.rstrip()}'")
 
-        # Flag unexpected top-level keys (not indented, not a comment)
         m = re.match(r'^([A-Za-z][A-Za-z0-9_]*):', raw)
-        if m and m.group(1) not in KNOWN_KEYS:
-            issues.append(
-                f"Line {lineno}: Unknown/unexpected top-level key '{m.group(1)}' "
-                f"— may be a misplaced line or typo (will be dropped)"
-            )
-
-    # Duplicate mapping keys (numeric, e.g. AppTokens)
-    seen_keys: dict = {}
-    for lineno, raw in enumerate(lines, 1):
-        m = re.match(r'^(\s*)([0-9]+):\s+', raw)
         if m:
-            indent = len(m.group(1))
-            key    = m.group(2)
-            entry  = (indent, key)
+            seen_keys.clear()
+            if m.group(1) not in KNOWN_KEYS:
+                issues.append(
+                    f"Line {lineno}: Unknown top-level key '{m.group(1)}'"
+                    f" — may be a typo or misplaced line (will be dropped)"
+                )
+
+        # Duplicate numeric mapping keys
+        dm = re.match(r'^(\s*)([0-9]+):\s+', raw)
+        if dm:
+            entry = (len(dm.group(1)), dm.group(2))
             if entry in seen_keys:
                 issues.append(
-                    f"Line {lineno}: Duplicate mapping key '{key}' "
-                    f"(first seen at line {seen_keys[entry]})"
+                    f"Line {lineno}: Duplicate mapping key '{dm.group(2)}'"
+                    f" (first at line {seen_keys[entry]})"
                 )
             else:
                 seen_keys[entry] = lineno
@@ -569,35 +552,17 @@ def validate_config(config_path: Path) -> list:
 # ──────────────────────────────────────────────────────────────
 
 def fmt_list(entries: list, indent: int = 2) -> str:
-    """
-    Format a list of ConfigEntry objects.
-    Output:
-      - 237990 # The Banner Saga
-      - 312520 # Rain World
-      - 333640
-    """
     pad = " " * indent
-    lines = []
-    for entry in entries:
-        lines.append(f"{pad}- {entry.raw_value}")
-    return "\n".join(lines)
+    return "\n".join(f"{pad}- {e.raw_value}" for e in entries)
 
 
 def fmt_map(entries: dict, indent: int = 2) -> str:
-    """
-    Format a dict of {key: ConfigEntry} objects.
-    Output:
-      1274570: 480
-      3146520: 480 # Webfishing
-      227300: 7693758108019961089
-    """
-    pad = " " * indent
+    pad   = " " * indent
     lines = []
     for k, v in entries.items():
         if v is None:
             lines.append(f"{pad}{k}:")
         elif isinstance(v, list):
-            # map-of-lists sub-entry (DlcData style)
             lines.append(f"{pad}{k}:")
             for item in v:
                 lines.append(f"{pad}  - {item.raw_value}")
@@ -607,14 +572,7 @@ def fmt_map(entries: dict, indent: int = 2) -> str:
 
 
 def fmt_map_of_lists(entries: dict, indent: int = 2) -> str:
-    """
-    Format DenuvoGames-style dict of {key: list[ConfigEntry]}.
-    Output:
-      SteamId:
-        - AppId1
-        - AppId2
-    """
-    pad = " " * indent
+    pad   = " " * indent
     lines = []
     for k, v in entries.items():
         lines.append(f"{pad}{k}:")
@@ -625,13 +583,12 @@ def fmt_map_of_lists(entries: dict, indent: int = 2) -> str:
 
 
 # ──────────────────────────────────────────────────────────────
-# Deduplication helpers
+# Deduplication
 # ──────────────────────────────────────────────────────────────
 
 def dedup_list(entries: list) -> list:
-    """Remove duplicate list entries, preserving order and keeping comments."""
-    seen = set()
-    result = []
+    """Remove duplicate list entries; preserve order, keep first occurrence."""
+    seen, result = set(), []
     for entry in entries:
         key = entry.dedup_key
         if key not in seen:
@@ -642,63 +599,135 @@ def dedup_list(entries: list) -> list:
 
 def dedup_map(entries: dict) -> dict:
     """
-    Remove duplicate map keys. Last occurrence wins (so the most recent
-    copy is kept). Returns an OrderedDict-like plain dict (Python 3.7+
-    preserves insertion order) with the first-seen key positions kept,
-    but values replaced by the last seen.
+    Remove duplicate map keys. Last value wins; insertion order from first
+    occurrence is preserved (Python 3.7+ dict semantics handle this natively).
     """
-    # Track first-seen order
-    ordered = {}
+    ordered: dict = {}
     for k, v in entries.items():
-        if k not in ordered:
-            ordered[k] = v
-        else:
-            # overwrite with last value (keeps key in original position)
-            ordered[k] = v
+        ordered[k] = v   # re-assigning an existing key updates value, not position
     return ordered
+
+
+# ──────────────────────────────────────────────────────────────
+# Steam name resolution  (module-level cache + parallel lookups)
+# ──────────────────────────────────────────────────────────────
+
+_name_cache: dict[str, str] = {"480": "Spacewar"}
+
+
+def get_name(appid: str) -> str:
+    """
+    Query the SteamCMD API for an app's display name.
+    Results are cached in _name_cache so parallel threads avoid duplicate requests.
+    """
+    if not appid:
+        return ""
+    if appid in _name_cache:
+        return _name_cache[appid]
+    url = f"https://api.steamcmd.net/v1/info/{appid}"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=STEAM_API_TIMEOUT) as resp:
+            res = json.loads(resp.read().decode("utf-8"))
+            if res.get("status") == "success":
+                app_info = res.get("data", {}).get(appid, {})
+                name     = app_info.get("common", {}).get("name") or app_info.get("name")
+                if name:
+                    _name_cache[appid] = name
+                    return name
+    except Exception:
+        pass
+    _name_cache[appid] = ""
+    return ""
+
+
+def resolve_missing_names(old_data: dict) -> None:
+    """
+    Fill in missing inline comments (game names) for AdditionalApps and FakeAppIds.
+    All API lookups are issued in parallel for speed.
+    """
+    additional_apps = old_data.get("AdditionalApps") or []
+    fake_app_ids    = old_data.get("FakeAppIds")     or {}
+
+    missing_additional = [
+        e for e in additional_apps
+        if isinstance(e, ConfigEntry) and "#" not in e.raw_value
+    ]
+    missing_fake = [
+        (k, e) for k, e in fake_app_ids.items()
+        if isinstance(e, ConfigEntry) and "#" not in e.raw_value
+    ]
+
+    if not missing_additional and not missing_fake:
+        return
+
+    # Collect every unique app ID that still needs a lookup
+    all_ids: set[str] = set()
+    for entry in missing_additional:
+        all_ids.add(entry.dedup_key)
+    for src_appid, entry in missing_fake:
+        all_ids.add(src_appid)
+        all_ids.add(entry.dedup_key)
+    uncached = {aid for aid in all_ids if aid.isdigit() and aid not in _name_cache}
+
+    if uncached:
+        info(f"Resolving {len(uncached)} game name(s) in parallel...")
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            futures = {ex.submit(get_name, aid): aid for aid in uncached}
+            for f in as_completed(futures):
+                pass   # side-effect: results land in _name_cache
+
+    # Patch entries using the now-populated cache
+    for entry in missing_additional:
+        appid = entry.dedup_key
+        name  = _name_cache.get(appid, "")
+        if appid.isdigit() and name:
+            entry.raw_value = f"{appid} # {name}"
+            info(f"  AdditionalApps {appid} → {name}")
+
+    for src_appid, entry in missing_fake:
+        tgt_appid = entry.dedup_key
+        if not (src_appid.isdigit() and tgt_appid.isdigit()):
+            continue
+        src_name = _name_cache.get(src_appid, "")
+        tgt_name = _name_cache.get(tgt_appid, "")
+        if src_name:
+            comment         = f"{src_name} → {tgt_name}" if tgt_name else src_name
+            entry.raw_value = f"{tgt_appid} # {comment}"
+            info(f"  FakeAppIds {src_appid}:{tgt_appid} → {src_name}")
+
+
+# ──────────────────────────────────────────────────────────────
+# Fetch + extract template YAML from GitHub
+# ──────────────────────────────────────────────────────────────
+
+def fetch_template(url: str) -> str:
+    """Download config_default.hpp and extract the YAML raw-string literal."""
+    try:
+        with urllib.request.urlopen(url, timeout=TEMPLATE_TIMEOUT) as resp:
+            source = resp.read().decode("utf-8", errors="replace")
+    except Exception as exc:
+        raise RuntimeError(f"Failed to download template: {exc}")
+
+    match = re.search(r'= R"\((.+?)\)";', source, re.DOTALL)
+    if not match:
+        raise RuntimeError("Could not find the YAML template inside config_default.hpp!")
+
+    return match.group(1)
 
 
 # ──────────────────────────────────────────────────────────────
 # Merge old config values into fresh template
 # ──────────────────────────────────────────────────────────────
 
-# Which top-level keys hold scalar values
-SCALAR_KEYS = {
-    "DisableFamilyShareLock", "UseWhitelist", "AutoFilterList",
-    "PlayNotOwnedGames", "SafeMode", "Notifications", "WarnHashMissmatch",
-    "NotifyInit", "API", "DisableCloud", "FakeEmail", "FakeWalletBalance",
-    "LogLevel", "ExtendedLogging",
-}
-# Which keys hold YAML lists (  - value)
-LIST_KEYS = {"AppIds", "AdditionalApps", "FakeOffline"}
-# Which keys hold simple mappings (  key: value)
-MAP_KEYS = {"AppTokens", "FakeAppIds", "GameTitles", "SubscriptionTimestamps", "DlcData"}
-# Which keys hold mapping-of-lists (  key:\n    - item)
-MAP_OF_LIST_KEYS = {"DenuvoGames"}
-# Special sub-map
-IDLE_STATUS_KEY = "IdleStatus"
-
-# All known top-level keys — used by validator to flag unexpected keys
-KNOWN_KEYS = (
-    SCALAR_KEYS
-    | LIST_KEYS
-    | MAP_KEYS
-    | MAP_OF_LIST_KEYS
-    | {IDLE_STATUS_KEY, "UnownedStatus"}
-)
-
 def _skip_template_children(template_lines: list, start: int) -> int:
-    """Skip over indented child lines in the template (we replace them with user data)."""
+    """Skip over indented child lines in the template (replaced by user data)."""
     i = start
     n = len(template_lines)
     while i < n:
         child = template_lines[i]
-        cs = child.strip()
-        # Blank line → end of children block; keep this line (it's a spacer)
-        if not cs:
-            break
-        # Comment → end of children block (next section starts)
-        if cs.startswith("#"):
+        cs    = child.strip()
+        if not cs or cs.startswith("#"):
             break
         if child.startswith("  ") or child.startswith("\t"):
             i += 1
@@ -709,25 +738,23 @@ def _skip_template_children(template_lines: list, start: int) -> int:
 
 def merge_config(template_yaml: str, old_data: dict) -> str:
     """
-    Walk the template line-by-line, injecting the user's values wherever
-    a known key appears. Template comments and structure are preserved.
+    Walk the template line-by-line, injecting the user's values wherever a
+    known key appears. Template comments and overall structure are preserved.
     """
-    out_lines = []
+    out_lines      = []
     template_lines = template_yaml.splitlines()
     i = 0
     n = len(template_lines)
 
     while i < n:
-        line = template_lines[i]
+        line     = template_lines[i]
         stripped = line.strip()
 
-        # ── Blank line or comment → pass through unchanged ───────
         if not stripped or stripped.startswith("#"):
             out_lines.append(line)
             i += 1
             continue
 
-        # ── Match top-level key ──────────────────────────────────
         m = re.match(r'^([A-Za-z][A-Za-z0-9_]*):\s*(.*)', line)
         if not m:
             out_lines.append(line)
@@ -737,193 +764,75 @@ def merge_config(template_yaml: str, old_data: dict) -> str:
         key         = m.group(1)
         default_val = m.group(2).strip()
 
-        # ────────────────────────────────────────────────────────
-        # SCALAR: DisableFamilyShareLock, LogLevel, FakeEmail, etc.
-        # ────────────────────────────────────────────────────────
+        # ── Scalar ───────────────────────────────────────────────
         if key in SCALAR_KEYS:
             user_val = old_data.get(key)
-            val_to_write = user_val if (user_val is not None and isinstance(user_val, str)) else default_val
-            
-            # Map scalar values to ensure they comply with SLSsteam requirements
-            # All boolean keys are normalized to 'yes' or 'no'
-            BOOLEAN_KEYS = {
-                "DisableFamilyShareLock", "UseWhitelist", "AutoFilterList",
-                "PlayNotOwnedGames", "SafeMode", "Notifications", "WarnHashMissmatch",
-                "NotifyInit", "API", "DisableCloud", "ExtendedLogging",
-            }
+            val      = user_val if isinstance(user_val, str) and user_val else default_val
             if key in BOOLEAN_KEYS:
-                val_to_write = sanitize_boolean(val_to_write, default_val)
+                val = sanitize_boolean(val, default_val)
             elif key == "LogLevel":
-                val_to_write = sanitize_log_level(val_to_write, default_val)
+                val = sanitize_log_level(val, default_val)
             elif key == "FakeWalletBalance":
-                val_to_write = sanitize_wallet_balance(val_to_write, default_val)
+                val = sanitize_wallet_balance(val, default_val)
             elif key == "FakeEmail":
-                # Clean and wrap email in quotes if it's set and not yet quoted
-                if not val_to_write or val_to_write == '""':
-                    val_to_write = '""'
-                elif not (val_to_write.startswith('"') or val_to_write.startswith("'")):
-                    val_to_write = f'"{val_to_write.strip()}"'
-                    
-            out_lines.append(f"{key}: {val_to_write}")
+                if not val or val == '""':
+                    val = '""'
+                elif not (val.startswith('"') or val.startswith("'")):
+                    val = f'"{val.strip()}"'
+            out_lines.append(f"{key}: {val}")
             i += 1
 
-        # ────────────────────────────────────────────────────────
-        # LIST: AppIds, AdditionalApps, FakeOffline
-        # Output format:
-        #   AdditionalApps:
-        #     - 237990 # The Banner Saga
-        #     - 312520 # Rain World
-        # ────────────────────────────────────────────────────────
+        # ── List ─────────────────────────────────────────────────
         elif key in LIST_KEYS:
             out_lines.append(f"{key}:")
             user_val = old_data.get(key)
-            if user_val and isinstance(user_val, list):
+            if isinstance(user_val, list):
                 clean = dedup_list(user_val)
                 if clean:
                     out_lines.append(fmt_list(clean))
             i += 1
             i = _skip_template_children(template_lines, i)
 
-        # ────────────────────────────────────────────────────────
-        # MAP: AppTokens, FakeAppIds, GameTitles, etc.
-        # Output format:
-        #   FakeAppIds:
-        #     1274570: 480
-        #     3146520: 480 # Webfishing
-        # ────────────────────────────────────────────────────────
+        # ── Mapping ──────────────────────────────────────────────
         elif key in MAP_KEYS:
             out_lines.append(f"{key}:")
             user_val = old_data.get(key)
-            if user_val and isinstance(user_val, dict):
+            if isinstance(user_val, dict):
                 clean = dedup_map(user_val)
                 if clean:
                     out_lines.append(fmt_map(clean))
             i += 1
             i = _skip_template_children(template_lines, i)
 
-        # ────────────────────────────────────────────────────────
-        # MAP-OF-LISTS: DenuvoGames
-        # Output format:
-        #   DenuvoGames:
-        #     SteamId:
-        #       - AppId1
-        # ────────────────────────────────────────────────────────
+        # ── Mapping-of-lists ─────────────────────────────────────
         elif key in MAP_OF_LIST_KEYS:
             out_lines.append(f"{key}:")
             user_val = old_data.get(key)
-            if user_val and isinstance(user_val, dict):
+            if isinstance(user_val, dict):
                 out_lines.append(fmt_map_of_lists(user_val))
             i += 1
             i = _skip_template_children(template_lines, i)
 
-        # ────────────────────────────────────────────────────────
-        # IdleStatus / UnownedStatus (structured sub-map)
-        # Output format:
-        #   IdleStatus:
-        #     AppId: 0
-        #     Title: ""
-        # ────────────────────────────────────────────────────────
+        # ── IdleStatus / UnownedStatus ────────────────────────────
         elif key in (IDLE_STATUS_KEY, "UnownedStatus"):
             out_lines.append(f"{key}:")
             user_val = old_data.get(key)
             if isinstance(user_val, dict):
                 app_id = user_val.get("AppId", "0")
-                title  = user_val.get("Title", '""')
+                title  = sanitize_title(user_val.get("Title", '""'))
             else:
-                app_id = "0"
-                title  = '""'
-            # Ensure title is properly sanitized and wrapped in quotes
-            title = sanitize_title(title)
+                app_id, title = "0", '""'
             out_lines.append(f"  AppId: {app_id}")
             out_lines.append(f"  Title: {title}")
             i += 1
             i = _skip_template_children(template_lines, i)
 
-        # ────────────────────────────────────────────────────────
-        # Unknown key → pass through unchanged
-        # ────────────────────────────────────────────────────────
+        # ── Unknown key → pass through unchanged ──────────────────
         else:
             out_lines.append(line)
             i += 1
 
-    # Single trailing newline
-    result = "\n".join(out_lines)
-    result = result.rstrip("\n") + "\n"
-    return result
-
-
-def resolve_missing_names(old_data: dict):
-    """
-    Query steamcmd API to fill in missing game names/comments for:
-      - AdditionalApps (list items)
-      - FakeAppIds (mapping values)
-    """
-    additional_apps = old_data.get("AdditionalApps")
-    fake_app_ids = old_data.get("FakeAppIds")
-
-    # Quick check: is there anything missing comments?
-    missing_additional = []
-    if additional_apps and isinstance(additional_apps, list):
-        for entry in additional_apps:
-            if "#" not in entry.raw_value:
-                missing_additional.append(entry)
-
-    missing_fake = []
-    if fake_app_ids and isinstance(fake_app_ids, dict):
-        for k, entry in fake_app_ids.items():
-            if entry and "#" not in entry.raw_value:
-                missing_fake.append((k, entry))
-
-    if not missing_additional and not missing_fake:
-        return
-
-    info("Resolving missing game names via SteamCMD API...")
-    cache = {"480": "Spacewar"}
-
-    def get_name(appid: str) -> str:
-        if not appid:
-            return ""
-        if appid in cache:
-            return cache[appid]
-        url = f"https://api.steamcmd.net/v1/info/{appid}"
-        try:
-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, timeout=4) as resp:
-                res = json.loads(resp.read().decode("utf-8"))
-                if res.get("status") == "success":
-                    app_info = res.get("data", {}).get(appid, {})
-                    name = app_info.get("common", {}).get("name")
-                    if not name:
-                        name = app_info.get("name")
-                    if name:
-                        cache[appid] = name
-                        return name
-        except Exception:
-            pass
-        cache[appid] = ""
-        return ""
-
-    # Resolve for AdditionalApps
-    for entry in missing_additional:
-        appid = entry.dedup_key
-        if appid.isdigit():
-            name = get_name(appid)
-            if name:
-                entry.raw_value = f"{appid} # {name}"
-                info(f"  Resolved AdditionalApps appid {appid} -> {name}")
-
-    # Resolve for FakeAppIds
-    for src_appid, entry in missing_fake:
-        tgt_appid = entry.dedup_key
-        if src_appid.isdigit() and tgt_appid.isdigit():
-            src_name = get_name(src_appid)
-            tgt_name = get_name(tgt_appid)
-            if src_name:
-                if tgt_name:
-                    entry.raw_value = f"{tgt_appid} # {src_name} -> {tgt_name}"
-                else:
-                    entry.raw_value = f"{tgt_appid} # {src_name}"
-                info(f"  Resolved FakeAppIds {src_appid}:{tgt_appid} -> {src_name}")
+    return "\n".join(out_lines).rstrip("\n") + "\n"
 
 
 # ──────────────────────────────────────────────────────────────
@@ -934,7 +843,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="SLSsteam config.yaml cleanup & update tool",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=textwrap.dedent("""\
+        epilog=textwrap.dedent(f"""\
             Examples:
               Validate your current config for errors:
                 python3 slssteam_config.py --validate-only
@@ -947,54 +856,60 @@ def main():
 
               Write to a different output file:
                 python3 slssteam_config.py --output /tmp/config_new.yaml
+
+              Skip outbound name lookups:
+                python3 slssteam_config.py --no-resolve-names
         """),
     )
     parser.add_argument(
         "--config", type=Path, default=DEFAULT_CONFIG_PATH,
-        help=f"Path to your config.yaml (default: {DEFAULT_CONFIG_PATH})",
+        help=f"Path to config.yaml (default: {DEFAULT_CONFIG_PATH})",
     )
     parser.add_argument(
         "--output", type=Path, default=None,
         help="Output path (default: overwrites --config after backup)",
     )
-    parser.add_argument(
-        "--dry-run", action="store_true",
-        help="Print merged config to stdout, don't write to disk",
-    )
-    parser.add_argument(
-        "--no-backup", action="store_true",
-        help="Skip creating a .bak backup before writing",
-    )
-    parser.add_argument(
-        "--validate-only", action="store_true",
-        help="Only validate your existing config, don't merge or write",
-    )
+    parser.add_argument("--dry-run",          action="store_true",
+                        help="Print merged config to stdout, don't write to disk")
+    parser.add_argument("--no-backup",        action="store_true",
+                        help="Skip creating a .bck backup before writing")
+    parser.add_argument("--validate-only",    action="store_true",
+                        help="Only check for errors, don't merge or write")
+    parser.add_argument("--no-resolve-names", action="store_true",
+                        help="Skip outbound SteamCMD API calls for game name resolution")
     parser.add_argument(
         "--template-url", default=TEMPLATE_SOURCE_URL,
         help="Override the GitHub URL for the default config template",
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
 
     args = parser.parse_args()
+
+    # Interactive mode: no CLI flags were passed by the user
+    interactive = (
+        args.config          == DEFAULT_CONFIG_PATH
+        and args.output      is None
+        and not args.dry_run
+        and not args.no_backup
+        and not args.validate_only
+        and not args.no_resolve_names
+        and args.template_url == TEMPLATE_SOURCE_URL
+    )
+
+    print()
+    print(f"{BOLD}{'='*60}{RESET}")
+    print(f"{BOLD}   SLSsteam Config Cleanup & Update Tool  v{VERSION}{RESET}")
+    print(f"{BOLD}{'='*60}{RESET}")
+    print()
+
     config_path: Path = args.config
-
-    print()
-    print(f"{BOLD}{'='*60}{RESET}")
-    print(f"{BOLD}   SLSsteam Config Cleanup & Update Tool{RESET}")
-    print(f"{BOLD}{'='*60}{RESET}")
-    print()
-
-    # Detect if we should run interactively
-    cli_flags = ["--config", "--output", "--dry-run", "--no-backup", "--validate-only"]
-    interactive = not any(flag in sys.argv for flag in cli_flags)
-
-    choice = 1
-    config_path = args.config
+    choice            = 1
 
     if interactive:
         print("Please select an option:")
-        print("  1) Clean & Update Config (normal flow)")
-        print("  2) Restore Backup (from config.bck)")
-        print("  3) Apply Recommended Settings for Steam Deck (SafeMode, Notifications, LogLevel: 2, etc.)")
+        print("  1) Clean & Update Config")
+        print("  2) Restore Backup  (from config.bck)")
+        print("  3) Apply Steam Deck Recommended Settings")
         while True:
             try:
                 user_choice = input("Enter choice (1-3, default: 1): ").strip()
@@ -1007,31 +922,28 @@ def main():
             if user_choice in ("1", "2", "3"):
                 choice = int(user_choice)
                 break
-            print("Invalid choice. Please enter a number between 1 and 3.")
+            print("Invalid choice. Please enter 1, 2, or 3.")
         print()
 
-    # If Option 2 (Restore Backup)
+    # ── Option 2: Restore backup ─────────────────────────────────
     if interactive and choice == 2:
-        print(f"Default config location is: {DEFAULT_CONFIG_PATH}")
+        print(f"Default config location: {DEFAULT_CONFIG_PATH}")
         while True:
             try:
-                user_input = input(f"Enter path to your config.yaml (press Enter for default): ").strip()
+                user_input = input("Enter path to config.yaml (press Enter for default): ").strip()
             except (KeyboardInterrupt, EOFError):
                 print("\nCancelled.")
                 sys.exit(0)
-            if not user_input:
-                config_path = DEFAULT_CONFIG_PATH
-            else:
-                config_path = Path(user_input).expanduser().resolve()
-            
+            config_path = (
+                Path(user_input).expanduser().resolve() if user_input else DEFAULT_CONFIG_PATH
+            )
             bak_path = config_path.with_suffix(".bck")
             if bak_path.exists():
                 break
-            else:
-                error(f"Backup file not found: {bak_path}. Please try again.")
-                print()
-        
-        info(f"Restoring backup from {bak_path} to {config_path}...")
+            error(f"Backup file not found: {bak_path}. Please try again.")
+            print()
+
+        info(f"Restoring {bak_path} → {config_path} ...")
         try:
             shutil.copy2(bak_path, config_path)
             ok("Backup successfully restored.")
@@ -1041,28 +953,23 @@ def main():
         print()
         return
 
-    # If Option 1 or 3 (or CLI non-interactive flow)
+    # ── Options 1/3 (interactive) or non-interactive CLI ─────────
     if interactive:
-        print(f"Default config location is: {DEFAULT_CONFIG_PATH}")
+        print(f"Default config location: {DEFAULT_CONFIG_PATH}")
         while True:
             try:
-                user_input = input(f"Enter path to your config.yaml (press Enter for default): ").strip()
+                user_input = input("Enter path to config.yaml (press Enter for default): ").strip()
             except (KeyboardInterrupt, EOFError):
                 print("\nCancelled.")
                 sys.exit(0)
-            
-            if not user_input:
-                config_path = DEFAULT_CONFIG_PATH
-            else:
-                config_path = Path(user_input).expanduser().resolve()
-            
+            config_path = (
+                Path(user_input).expanduser().resolve() if user_input else DEFAULT_CONFIG_PATH
+            )
             if config_path.exists():
                 break
-            else:
-                error(f"Config file not found: {config_path}. Please try again.")
-                print()
+            error(f"Config file not found: {config_path}. Please try again.")
+            print()
     else:
-        # If --config was passed on command line, verify it exists once
         if not config_path.exists():
             error(f"Config file not found: {config_path}")
             error("Make sure SLSsteam has been run at least once.")
@@ -1089,74 +996,67 @@ def main():
         else:
             print(f"{GREEN}Validation complete — config looks good!{RESET}")
         return
-
     print()
 
     # ── 2. Parse old config ──────────────────────────────────────
     print(f"{BOLD}[2/4] Parsing existing config...{RESET}")
     config_text = config_path.read_text(encoding="utf-8")
-    reader = SimpleYAMLReader()
-    old_data = reader.parse(config_text)
+    reader      = SimpleYAMLReader()
+    old_data    = reader.parse(config_text)
 
-    # Pretty-print a summary of what was found
     for section, val in old_data.items():
         if val is None:
             ok(f"  {section}: (empty)")
         elif isinstance(val, str):
             ok(f"  {section}: {val}")
-        elif isinstance(val, list):
+        elif isinstance(val, (list, dict)):
             ok(f"  {section}: {len(val)} entries")
-        elif isinstance(val, dict):
-            ok(f"  {section}: {len(val)} entries")
-    # ── 2.5 Resolve missing names ────────────────────────────────
-    resolve_missing_names(old_data)
+
+    if not args.no_resolve_names:
+        resolve_missing_names(old_data)
     print()
 
-    # ── 2.8 Apply overrides (Steam Deck presets) ─────────────────
+    # ── 2.5 Steam Deck preset (option 3) ─────────────────────────
     if interactive and choice == 3:
         info("Applying Steam Deck recommended overrides:")
-        info("  SafeMode: yes")
-        info("  Notifications: yes")
-        info("  LogLevel: 2")
-        info("  ExtendedLogging: no")
-        old_data["SafeMode"] = "yes"
-        old_data["Notifications"] = "yes"
-        old_data["LogLevel"] = "2"
-        old_data["ExtendedLogging"] = "no"
+        overrides = {
+            "SafeMode":        "yes",
+            "Notifications":   "yes",
+            "LogLevel":        "2",
+            "ExtendedLogging": "no",
+        }
+        for k, v in overrides.items():
+            info(f"  {k}: {v}")
+            old_data[k] = v
         print()
 
-    # ── 3. Fetch template from GitHub ────────────────────────────
+    # ── 3. Fetch template ────────────────────────────────────────
     print(f"{BOLD}[3/4] Fetching latest template from GitHub...{RESET}")
     template_yaml = fetch_template(args.template_url)
 
-    # Report new / removed keys vs your existing config
     template_data = reader.parse(template_yaml)
-    new_keys     = set(template_data.keys()) - set(old_data.keys())
-    removed_keys = set(old_data.keys())      - set(template_data.keys())
-
+    new_keys      = set(template_data) - set(old_data)
+    removed_keys  = set(old_data)      - set(template_data)
     if new_keys:
-        info(f"  New upstream key(s) — will use defaults: {', '.join(sorted(new_keys))}")
+        info(f"  New upstream key(s) — using defaults: {', '.join(sorted(new_keys))}")
     if removed_keys:
-        warn(f"  Key(s) in your config not in template (dropped): {', '.join(sorted(removed_keys))}")
+        warn(f"  Key(s) not in template (dropped): {', '.join(sorted(removed_keys))}")
     print()
 
     # ── 4. Merge ─────────────────────────────────────────────────
     print(f"{BOLD}[4/4] Merging your values into new template...{RESET}")
     merged = merge_config(template_yaml, old_data)
 
-    # Spot-check deduplication counts
     for key in list(MAP_KEYS) + list(LIST_KEYS):
         old_val = old_data.get(key)
         if isinstance(old_val, dict):
-            before = len(old_val)
-            after  = len(dedup_map(old_val))
-            if before != after:
-                info(f"  {key}: deduplicated {before} → {after} entries")
+            before, after = len(old_val), len(dedup_map(old_val))
         elif isinstance(old_val, list):
-            before = len(old_val)
-            after  = len(dedup_list(old_val))
-            if before != after:
-                info(f"  {key}: deduplicated {before} → {after} entries")
+            before, after = len(old_val), len(dedup_list(old_val))
+        else:
+            continue
+        if before != after:
+            info(f"  {key}: deduplicated {before} → {after} entries")
 
     ok("  Merge complete.")
     print()
@@ -1169,7 +1069,7 @@ def main():
         print(merged)
         return
 
-    out_path: Path = args.output if args.output else config_path
+    out_path: Path = args.output or config_path
 
     if not args.no_backup:
         bak_path = config_path.with_suffix(".bck")
@@ -1183,13 +1083,79 @@ def main():
     if issues:
         print(f"{YELLOW}Fixed {len(issues)} formatting issue(s) from your old config.{RESET}")
     if new_keys:
-        print(f"{CYAN}Added {len(new_keys)} new upstream key(s) with default values.{RESET}")
+        print(f"{CYAN}Added {len(new_keys)} new upstream key(s) with defaults.{RESET}")
     if removed_keys:
-        print(f"{YELLOW}Dropped {len(removed_keys)} key(s) that are no longer in the template.{RESET}")
+        print(f"{YELLOW}Dropped {len(removed_keys)} key(s) no longer in template.{RESET}")
 
     print()
     print(f"{GREEN}{BOLD}Done! Your config.yaml has been cleaned up and updated.{RESET}")
     print()
+
+
+def make_backup_with_rotation(config_path: Path) -> Path:
+    """
+    Creates a backup of config.yaml.
+    If config.yaml.bak exists, tries config.yaml.bak2, config.yaml.bak3, etc.
+    Returns the backup path.
+    """
+    bak_base = config_path.with_name(config_path.name + ".bak")
+    if not bak_base.exists():
+        shutil.copy2(config_path, bak_base)
+        return bak_base
+
+    i = 2
+    while True:
+        bak_rot = config_path.with_name(config_path.name + f".bak{i}")
+        if not bak_rot.exists():
+            shutil.copy2(config_path, bak_rot)
+            return bak_rot
+        i += 1
+
+
+def run_asshead_migration(config_path: Path, template_url: str = TEMPLATE_SOURCE_URL) -> tuple[bool, str, Optional[Path]]:
+    """
+    Runs validation and merge of config.yaml.
+    If changes/fixes are needed, creates a rotating backup and writes the merged config.
+    Returns (success, message, backup_path).
+    """
+    try:
+        if not config_path.exists():
+            return False, f"Config file not found at {config_path}", None
+
+        # 1. Parse old config
+        config_text = config_path.read_text(encoding="utf-8")
+        reader = SimpleYAMLReader()
+        old_data = reader.parse(config_text)
+
+        # 2. Fetch template
+        template_yaml = fetch_template(template_url)
+        template_data = reader.parse(template_yaml)
+
+        # 3. Check if changes are needed
+        issues = validate_config(config_path)
+        new_keys = set(template_data) - set(old_data)
+
+        # If no issues and no new keys, then it's already optimal!
+        if not issues and not new_keys:
+            return True, "No changes needed. SLSsteam config is already optimal!", None
+
+        # 4. Merge values into new template
+        merged = merge_config(template_yaml, old_data)
+
+        # 5. Create backup and write
+        bak_path = make_backup_with_rotation(config_path)
+        config_path.write_text(merged, encoding="utf-8")
+
+        msg = "Successfully updated config.yaml to the latest template and cleaned formatting."
+        if new_keys:
+            msg += f" Added {len(new_keys)} new upstream default key(s)."
+        if issues:
+            msg += f" Fixed {len(issues)} formatting issue(s)."
+
+        return True, msg, bak_path
+
+    except Exception as e:
+        return False, f"Error: {e}", None
 
 
 if __name__ == "__main__":
