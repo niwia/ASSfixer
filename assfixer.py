@@ -1413,6 +1413,11 @@ def main() -> None:
 
     out_path: Path = args.output or config_path
 
+    if out_path == config_path and merged == config_text:
+        ok("No changes detected. Config is already optimal!")
+        print()
+        return
+
     if not args.no_backup:
         bak_path = make_backup_with_rotation(config_path)
         ok(f"Backup created: {bak_path}")
