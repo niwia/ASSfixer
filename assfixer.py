@@ -57,7 +57,7 @@ from typing import Optional, List, Dict, Tuple, Set
 # Version
 # ──────────────────────────────────────────────────────────────
 
-VERSION = "3.2.0"
+VERSION = "3.2.2"
 
 boot_status = None
 boot_issues = []
@@ -66,12 +66,23 @@ boot_issues = []
 # Path / URL constants
 # ──────────────────────────────────────────────────────────────
 
+FLATPAK_STEAM_INSTALL_DIR = (
+    Path.home() / ".var" / "app" / "com.valvesoftware.Steam" / ".steam" / "steam"
+)
 FLATPAK_CONFIG_PATH = (
     Path.home() / ".var" / "app" / "com.valvesoftware.Steam"
     / ".config" / "SLSsteam" / "config.yaml"
 )
 NATIVE_CONFIG_PATH  = Path.home() / ".config" / "SLSsteam" / "config.yaml"
-DEFAULT_CONFIG_PATH = FLATPAK_CONFIG_PATH if FLATPAK_CONFIG_PATH.exists() else NATIVE_CONFIG_PATH
+
+# Detect Flatpak vs native the same way headcrab.sh's whereSLSsteamconfig() does:
+# key off whether *Steam itself* is installed as a Flatpak, not off whether the
+# SLSsteam config file/folder has already been created. Checking the config
+# path's own existence breaks on first run (folder doesn't exist yet) or when
+# stale empty dirs are left over from a previous native install.
+DEFAULT_CONFIG_PATH = (
+    FLATPAK_CONFIG_PATH if FLATPAK_STEAM_INSTALL_DIR.exists() else NATIVE_CONFIG_PATH
+)
 
 # C++ source that embeds the YAML default template as a raw string literal.
 TEMPLATE_SOURCE_URL = (
