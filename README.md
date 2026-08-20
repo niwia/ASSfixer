@@ -1,15 +1,28 @@
 # ASSfixer
-
-An automated, smart `config.yaml` cleanup, validation, and migration tool for [SLSsteam](https://github.com/AceSLS/SLSsteam).
-
-## Features
-- **Strict Value Sanitization**: Automatically normalizes booleans (`true`/`on`/`1` to `yes`), checks `LogLevel` limits, and fixes malformed/unclosed quoted strings (like `Title: " ;` back to `Title: ""`).
-- **YAML Structure Healing**: Automatically converts scalar values on single lines (e.g. `FakeOffline: 1274570`) into correct YAML lists or map structures.
-- **Deduplication**: Merges duplicate list items and map keys (latest value wins).
-- **GitHub Sync**: Fetches the latest default config template from the SLSsteam repository and updates your local config with new keys (preserving comments).
-- **Game Name Resolver**: Queries the SteamCMD API to resolve names/comments for AppIds in `AdditionalApps` and `FakeAppIds` that do not have comments.
-
----
+Fetches the latest default config template from the SLSsteam GitHub repo,
+parases your existing config.yaml, and produces a perfectly-formatted output
+that carries over ALL your personal values into the new template structure.
+ 
+This tool is fully self-adapting: key types are inferred automatically from:
+  1. Inline default values in the template (scalar detection)
+  2. Commented-out examples in the template header (list vs map detection)
+  3. The structure of your own config.yaml for any remaining unknowns
+ 
+No manual updates are needed when the SLSsteam developer adds or removes keys.
+ 
+Preserved exactly as-is (with normalized spacing):
+  - AdditionalApps / AppIds / FakeOffline  list items + their inline comments
+  - FakeAppIds / AppTokens mapping entries + their inline comments
+  - GameTitles / SubscriptionTimestamps / DlcData / DenuvoGames entries
+  - All scalar settings (DisableFamilyShareLock, LogLevel, FakeEmail, etc.)
+  - IdleStatus sub-map
+ 
+Cleaned automatically:
+  - Duplicate AppToken / mapping keys → deduplicated (last value wins)
+  - Extra spaces before inline comments → normalized to one space
+  - Trailing whitespace on every line
+  - All template comments are preserved verbatim
+ 
 
 ## Direct Launch (One-liner)
 
