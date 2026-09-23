@@ -43,21 +43,26 @@ Options:
 
 import argparse
 import json
+import logging
+import os
 import re
 import shutil
 import sys
 import textwrap
+import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple, Set
 
+logger = logging.getLogger(__name__)
+
 # ──────────────────────────────────────────────────────────────
 # Version
 # ──────────────────────────────────────────────────────────────
 
-VERSION = "3.2.2"
+VERSION = "3.2.3"
 
 boot_status = None
 boot_issues = []
@@ -74,23 +79,28 @@ FLATPAK_CONFIG_PATH = (
     / ".config" / "SLSsteam" / "config.yaml"
 )
 NATIVE_CONFIG_PATH  = Path.home() / ".config" / "SLSsteam" / "config.yaml"
-
-# Detect Flatpak vs native the same way headcrab.sh's whereSLSsteamconfig() does:
-# key off whether *Steam itself* is installed as a Flatpak, not off whether the
-# SLSsteam config file/folder has already been created. Checking the config
-# path's own existence breaks on first run (folder doesn't exist yet) or when
-# stale empty dirs are left over from a previous native install.
 DEFAULT_CONFIG_PATH = (
     FLATPAK_CONFIG_PATH if FLATPAK_STEAM_INSTALL_DIR.exists() else NATIVE_CONFIG_PATH
 )
 
-# C++ source that embeds the YAML default template as a raw string literal.
+# Primary template is res/config.yaml (clean YAML), with fallback to src/config_default.hpp (C++ embedded).
 TEMPLATE_SOURCE_URL = (
+    "https://raw.githubusercontent.com/AceSLS/SLSsteam/main/res/config.yaml"
+)
+FALLBACK_TEMPLATE_SOURCE_URL = (
     "https://raw.githubusercontent.com/AceSLS/SLSsteam/main/src/config_default.hpp"
 )
 
 TEMPLATE_TIMEOUT  = 15   # seconds – GitHub raw file download
 STEAM_API_TIMEOUT =  5   # seconds – per-game name lookups (many in parallel)
+
+
+def extract_template_yaml(raw_text: str) -> str:
+    """Extract YAML text, whether downloaded directly from res/config.yaml or embedded in C++ header."""
+    if not raw_text:
+        return ""
+    m = re.search(r'R"\((.+?)\)"', raw_text, re.DOTALL)
+    return m.group(1) if m else raw_text
 
 # ──────────────────────────────────────────────────────────────
 # Key type constants
@@ -109,6 +119,75 @@ NUMERIC_VALUE_MAP_KEYS = {
     "AppTokens", "FakeAppIds", "SubscriptionTimestamps",
     "ManifestIds", "DlcData",
 }
+
+# Known plugin keys (e.g. from download.lua plugin) that are valid extensions:
+KNOWN_PLUGIN_KEYS = {
+    "AdditionalDepots": TYPE_LIST,
+    "DecryptionKeys": TYPE_MAP,
+}
+
+def find_plugins_dir(config_path: Optional[Path] = None) -> Optional[Path]:
+    """Locate the SLSsteam plugins directory (native, flatpak, or adjacent to config)."""
+    if config_path:
+        adjacent = config_path.parent / "plugins"
+        if adjacent.is_dir():
+            return adjacent
+    if FLATPAK_STEAM_INSTALL_DIR.exists():
+        fp_dir = FLATPAK_CONFIG_PATH.parent / "plugins"
+        if fp_dir.is_dir():
+            return fp_dir
+    native_dir = NATIVE_CONFIG_PATH.parent / "plugins"
+    if native_dir.is_dir():
+        return native_dir
+    return None
+
+
+def discover_plugin_keys(plugins_dir: Optional[Path] = None) -> Dict[str, str]:
+    """Dynamically scan Lua plugins in plugins_dir to discover keys and types queried via SLS.config."""
+    if plugins_dir is None:
+        plugins_dir = find_plugins_dir()
+    if not plugins_dir or not plugins_dir.is_dir():
+        return {}
+
+    discovered: Dict[str, str] = {}
+    try:
+        for lua_file in plugins_dir.glob("*.lua"):
+            try:
+                content = lua_file.read_text(encoding="utf-8", errors="ignore")
+                # List methods: getIntList, getStringList, getList
+                for m in re.finditer(r'SLS\.config\s*:\s*(getIntList|getStringList|getList)\s*\(\s*["\']([A-Za-z0-9_]+)["\']', content):
+                    discovered[m.group(2)] = TYPE_LIST
+                # Scalar methods: getBool, getString, getInt, getFloat
+                for m in re.finditer(r'SLS\.config\s*:\s*(getBool|getString|getInt|getFloat)\s*\(\s*["\']([A-Za-z0-9_]+)["\']', content):
+                    discovered[m.group(2)] = TYPE_SCALAR
+                # Node / map methods: getNode
+                for m in re.finditer(r'SLS\.config\s*:\s*getNode\s*\(\s*["\']([A-Za-z0-9_]+)["\']', content):
+                    key_name = m.group(1)
+                    if "asPairList" in content:
+                        discovered[key_name] = TYPE_MAP
+                    else:
+                        discovered[key_name] = TYPE_UNKNOWN
+                # General fallback: SLS.config:someMethod("key") or SLS.config["key"]
+                for m in re.finditer(r'SLS\.config\s*[:\.\[]\s*["\']([A-Za-z0-9_]+)["\']', content):
+                    k = m.group(1)
+                    if k not in discovered:
+                        discovered[k] = TYPE_UNKNOWN
+            except Exception as e:
+                logger.debug(f"Error scanning plugin file {lua_file}: {e}")
+    except Exception as e:
+        logger.debug(f"Error discovering plugin keys in {plugins_dir}: {e}")
+
+    return discovered
+
+
+def get_effective_plugin_keys(config_path: Optional[Path] = None) -> Dict[str, str]:
+    """Return union of static fallback KNOWN_PLUGIN_KEYS and dynamically discovered plugin keys."""
+    keys = KNOWN_PLUGIN_KEYS.copy()
+    p_dir = find_plugins_dir(config_path)
+    if p_dir:
+        scanned = discover_plugin_keys(p_dir)
+        keys.update(scanned)
+    return keys
 
 IDLE_STATUS_KEY = "IdleStatus"
 
@@ -156,15 +235,23 @@ def _fetch_url(url: str, timeout: int) -> str:
 
 
 def fetch_template(url: str = TEMPLATE_SOURCE_URL) -> str:
-    """Download config_default.hpp and extract the embedded YAML template."""
+    """Download upstream template (YAML or C++ embedded) and return the YAML template."""
+    raw = None
     try:
         raw = _fetch_url(url, TEMPLATE_TIMEOUT)
     except Exception as exc:
-        raise RuntimeError(f"Failed to download template: {exc}")
-    m = re.search(r'static const char\* defaultConfig = R"\((.+?)\)";', raw, re.DOTALL)
-    if not m:
-        raise RuntimeError("Could not find YAML template in the downloaded C++ file.")
-    return m.group(1)
+        if url == TEMPLATE_SOURCE_URL and FALLBACK_TEMPLATE_SOURCE_URL:
+            logger.info(f"Primary template fetch failed ({exc}), trying fallback {FALLBACK_TEMPLATE_SOURCE_URL}...")
+            try:
+                raw = _fetch_url(FALLBACK_TEMPLATE_SOURCE_URL, TEMPLATE_TIMEOUT)
+            except Exception as exc2:
+                raise RuntimeError(f"Failed to download template: {exc2}")
+        else:
+            raise RuntimeError(f"Failed to download template: {exc}")
+    tmpl = extract_template_yaml(raw)
+    if not tmpl:
+        raise RuntimeError("Could not find valid YAML template in downloaded content.")
+    return tmpl
 
 
 # ──────────────────────────────────────────────────────────────
@@ -214,18 +301,17 @@ def _parse_commented_examples(raw_hpp: str) -> dict:
     return inferred
 
 
-def infer_key_types(raw_hpp: str) -> dict:
+def infer_key_types(raw_hpp: str, config_path: Optional[Path] = None) -> dict:
     """
     Auto-discover the type of every top-level config key without any external
     hints file. Uses two passes:
     Pass 1 — Template body: keys with non-empty defaults are detected as scalars;
               keys with indented children are detected as list/map/submap.
     Pass 2 — Template header comments: looks for commented-out example blocks.
+    Pass 3 — Plugin discovery: scans SLSsteam plugins directory for dynamically required keys.
     """
     comment_hints = _parse_commented_examples(raw_hpp)
-
-    m = re.search(r'static const char\* defaultConfig = R"\((.+?)\)";', raw_hpp, re.DOTALL)
-    template_yaml = m.group(1) if m else ""
+    template_yaml = extract_template_yaml(raw_hpp)
 
     key_types: dict[str, str] = {}
     lines = template_yaml.splitlines()
@@ -280,6 +366,7 @@ def infer_key_types(raw_hpp: str) -> dict:
 
         i += 1
 
+    key_types.update(get_effective_plugin_keys(config_path))
     return key_types
 
 
@@ -888,8 +975,9 @@ def validate_config(config_path: Path, key_types: dict) -> list:
         issues.append(f"Parse error: {exc}")
         return issues
 
+    plugin_keys = get_effective_plugin_keys(config_path)
     for key in data:
-        if key_types and key not in key_types and key != IDLE_STATUS_KEY:
+        if key_types and key not in key_types and key != IDLE_STATUS_KEY and key not in plugin_keys:
             issues.append(f"Key '{key}' not found in current upstream template (may have been removed)")
 
     return issues
@@ -923,7 +1011,7 @@ def _render_submap(submap: dict, indent: str = "  ") -> str:
     return "\n".join(out)
 
 
-def merge_config(template_yaml: str, user_data: dict, key_types: dict) -> str:
+def merge_config(template_yaml: str, user_data: dict, key_types: dict, config_path: Optional[Path] = None) -> str:
     out_lines = []
     lines = template_yaml.splitlines()
     i = 0
@@ -982,6 +1070,47 @@ def merge_config(template_yaml: str, user_data: dict, key_types: dict) -> str:
         elif ktype in (TYPE_MAP, TYPE_MAP_OF_LISTS) or (ktype == TYPE_UNKNOWN and isinstance(user_val, dict)):
             if isinstance(user_val, dict) and user_val:
                 out_lines.append(_render_map(user_val, key))
+
+    # Append any known or dynamically discovered plugin keys present in user_data that are not in the template
+    seen_template_keys = set()
+    for l in lines:
+        km = re.match(r'^([A-Za-z][A-Za-z0-9_]*)\s*:', l)
+        if km:
+            seen_template_keys.add(km.group(1))
+
+    effective_plugin_keys = get_effective_plugin_keys(config_path)
+    for pkey, pktype in effective_plugin_keys.items():
+        if pkey in user_data and pkey not in seen_template_keys:
+            u_val = user_data[pkey]
+            if u_val:
+                out_lines.append("")
+                out_lines.append(f"{pkey}:")
+                if pktype == TYPE_LIST or isinstance(u_val, list):
+                    out_lines.append(_render_list(u_val))
+                elif pktype in (TYPE_MAP, TYPE_MAP_OF_LISTS) or isinstance(u_val, dict):
+                    out_lines.append(_render_map(u_val, pkey))
+                elif isinstance(u_val, ConfigEntry):
+                    out_lines.append(f"  {u_val.val}")
+                else:
+                    out_lines.append(f"  {u_val}")
+
+    # Preserve any remaining unrecognized / custom user keys to prevent data loss
+    remaining_keys = [k for k in user_data if k not in seen_template_keys and k not in effective_plugin_keys and k != IDLE_STATUS_KEY]
+    if remaining_keys:
+        out_lines.append("")
+        out_lines.append("# Custom / Third-Party Settings (Preserved)")
+        for rkey in remaining_keys:
+            rval = user_data[rkey]
+            if rval:
+                out_lines.append(f"{rkey}:")
+                if isinstance(rval, list):
+                    out_lines.append(_render_list(rval))
+                elif isinstance(rval, dict):
+                    out_lines.append(_render_map(rval, rkey))
+                elif isinstance(rval, ConfigEntry):
+                    out_lines.append(f"  {rval.val}")
+                else:
+                    out_lines.append(f"  {rval}")
 
     return "\n".join(out_lines) + "\n"
 
@@ -1057,10 +1186,9 @@ def run_boot_config_check() -> None:
         try:
             raw_hpp = _fetch_url(TEMPLATE_SOURCE_URL, TEMPLATE_TIMEOUT)
             key_types = infer_key_types(raw_hpp)
-            m_tmpl = re.search(r'static const char\* defaultConfig = R"\((.+?)\)";', raw_hpp, re.DOTALL)
-            if not m_tmpl:
+            template_yaml = extract_template_yaml(raw_hpp)
+            if not template_yaml:
                 raise ValueError("Template syntax changed.")
-            template_yaml = m_tmpl.group(1)
 
             config_text = config_path.read_text(encoding="utf-8")
             reader = SimpleYAMLReader(key_types, lenient=True)
@@ -1090,54 +1218,205 @@ def run_boot_config_check() -> None:
             boot_status = "optimal"
     except Exception as e:
         boot_status = "failed"
-        boot_issues = [str(e)]
 
 
-def run_asshead_migration(config_path: Path, template_url: str = TEMPLATE_SOURCE_URL) -> tuple[bool, str, Optional[Path]]:
+def check_config_status(config_path: Optional[Path] = None, online: bool = True) -> Tuple[bool, str, List[str]]:
+    """Check config health against local rules and upstream template.
+
+    Returns:
+        (needs_repair, summary_message, details_list)
+    """
+    t0 = time.time()
+    if config_path is None:
+        try:
+            from utils.yaml_config_manager import get_user_config_path
+            config_path = get_user_config_path()
+        except Exception:
+            config_path = DEFAULT_CONFIG_PATH
+
+    logger.info(f"Checking SLSsteam config status (path: {config_path}, online: {online})...")
+
+    if not config_path.exists():
+        logger.warning(f"Config file not found at {config_path}")
+        return False, f"Config file not found at {config_path}", [f"File does not exist: {config_path}"]
+
     try:
-        if not config_path.exists():
-            return False, f"Config file not found at {config_path}", None
+        config_text = config_path.read_text(encoding="utf-8")
+    except Exception as e:
+        logger.error(f"Failed to read config file {config_path}: {e}")
+        return True, f"Failed to read config: {e}", [str(e)]
 
-        raw_hpp = _fetch_url(template_url, TEMPLATE_TIMEOUT)
-        key_types = infer_key_types(raw_hpp)
+    raw_hpp = ""
+    template_yaml = ""
+    key_types = {}
 
-        m = re.search(r'static const char\* defaultConfig = R"\((.+?)\)";', raw_hpp, re.DOTALL)
-        template_yaml = m.group(1) if m else ""
+    if online:
+        try:
+            logger.debug(f"Fetching upstream template from {TEMPLATE_SOURCE_URL} (timeout {TEMPLATE_TIMEOUT}s)...")
+            raw_hpp = _fetch_url(TEMPLATE_SOURCE_URL, TEMPLATE_TIMEOUT)
+            key_types = infer_key_types(raw_hpp, config_path=config_path)
+            template_yaml = extract_template_yaml(raw_hpp)
+            if not template_yaml:
+                raise ValueError("Could not extract default config from upstream template.")
+            logger.debug(f"Upstream template fetched successfully ({len(template_yaml)} chars, {len(key_types)} key types inferred).")
+        except Exception as e:
+            logger.warning(f"Network fetch failed for upstream template: {e}")
+            return True, f"Network check failed: {e}", [f"Could not fetch template from {TEMPLATE_SOURCE_URL}: {e}"]
+    else:
+        # Fallback to local template if offline
+        from utils.helpers import get_base_path
+        local_tmpl_path = get_base_path() / "SLSsteam" / "res" / "config.yaml"
+        if not local_tmpl_path.exists():
+            local_tmpl_path = Path(__file__).resolve().parent.parent.parent / "SLSsteam" / "config.yaml"
+        if local_tmpl_path.exists():
+            try:
+                template_yaml = local_tmpl_path.read_text(encoding="utf-8")
+                logger.debug(f"Using local template fallback from {local_tmpl_path}")
+            except Exception:
+                pass
+
+    reader = SimpleYAMLReader(key_types, lenient=True)
+    try:
+        old_data = reader.parse(config_text)
+    except Exception as parse_err:
+        logger.warning(f"Config YAML parse error: {parse_err}")
+        return True, "Config has syntax/parse errors", [f"Parse error: {parse_err}"]
+
+    issues = validate_config(config_path, key_types)
+    new_keys = set()
+    if template_yaml:
+        try:
+            tmpl_reader = SimpleYAMLReader(key_types, lenient=False)
+            template_data = tmpl_reader.parse(template_yaml)
+            new_keys = set(template_data) - set(old_data)
+        except Exception:
+            pass
+
+    details = []
+    if new_keys:
+        details.append(f"Missing {len(new_keys)} upstream default setting(s): {', '.join(sorted(new_keys))}")
+    if issues:
+        details.extend(issues)
+
+    elapsed = time.time() - t0
+    if details:
+        summary = f"Issues detected ({len(details)} item{'s' if len(details) != 1 else ''})"
+        if new_keys and not issues:
+            summary = f"{len(new_keys)} new upstream setting{'s' if len(new_keys) != 1 else ''} available"
+        logger.info(f"Config check completed in {elapsed:.2f}s: {summary} ({details})")
+        return True, summary, details
+    else:
+        logger.info(f"Config check completed in {elapsed:.2f}s: Config is up to date and healthy.")
+        return False, "Config is up to date and healthy!", []
+
+
+def repair_and_sync_config(config_path: Optional[Path] = None, online: bool = True) -> Tuple[bool, str, Optional[Path]]:
+    """Repair and synchronize config with upstream template in-place."""
+    if config_path is None:
+        try:
+            from utils.yaml_config_manager import get_user_config_path
+            config_path = get_user_config_path()
+        except Exception:
+            config_path = DEFAULT_CONFIG_PATH
+
+    if not config_path.exists():
+        return False, f"Config file not found at {config_path}", None
+
+    try:
+        raw_hpp = ""
+        template_yaml = ""
+        key_types = {}
+
+        if online:
+            try:
+                raw_hpp = _fetch_url(template_url, TEMPLATE_TIMEOUT)
+                key_types = infer_key_types(raw_hpp)
+                template_yaml = extract_template_yaml(raw_hpp)
+            except Exception:
+                pass
+
+        if not template_yaml:
+            from utils.helpers import get_base_path
+            local_tmpl_path = get_base_path() / "SLSsteam" / "res" / "config.yaml"
+            if not local_tmpl_path.exists():
+                local_tmpl_path = Path(__file__).resolve().parent.parent.parent / "SLSsteam" / "config.yaml"
+            if local_tmpl_path.exists():
+                template_yaml = local_tmpl_path.read_text(encoding="utf-8")
+
+        if not template_yaml:
+            return False, "Could not obtain a valid SLSsteam template.", None
+
+        if not key_types:
+            key_types = infer_key_types(raw_hpp, config_path=config_path) if raw_hpp else {}
 
         config_text = config_path.read_text(encoding="utf-8")
         reader = SimpleYAMLReader(key_types, lenient=True)
         old_data = reader.parse(config_text)
-        
+
         tmpl_reader = SimpleYAMLReader(key_types, lenient=False)
         template_data = tmpl_reader.parse(template_yaml)
 
         issues = validate_config(config_path, key_types)
         new_keys = set(template_data) - set(old_data)
 
-        if not issues and not new_keys:
-            return True, "No changes needed. SLSsteam config is already optimal!", None
-
-        resolve_missing_names(old_data)
-
-        merged = merge_config(template_yaml, old_data, key_types)
+        # Merge
+        merged = merge_config(template_yaml, old_data, key_types, config_path=config_path)
         bak_path = make_backup_with_rotation(config_path)
-        config_path.write_text(merged, encoding="utf-8")
 
-        msg = "Successfully updated config.yaml to the latest template."
+        # In-place write to preserve file inode for live SLS inotify
+        with open(config_path, "w", encoding="utf-8") as f:
+            f.write(merged)
+            f.flush()
+            os.fsync(f.fileno())
+
+        # Ensure ASSella prerequisites (API: yes, LogLevels: 0x2)
+        try:
+            from utils.yaml_config_manager import ensure_slssteam_prerequisites
+            ensure_slssteam_prerequisites(config_path)
+        except Exception:
+            pass
+
+        msg = "Successfully repaired and synchronized config.yaml."
         if new_keys:
             msg += f" Added {len(new_keys)} new key(s)."
         if issues:
-            msg += f" Fixed {len(issues)} formatting issue(s)."
+            msg += f" Fixed {len(issues)} issue(s)."
 
         return True, msg, bak_path
-
     except Exception as e:
-        return False, f"Error: {e}", None
+        return False, f"Repair failed: {e}", None
+
+
+def restore_config_backup(config_path: Optional[Path] = None) -> Tuple[bool, str, Optional[Path]]:
+    """Restore latest backup for config.yaml."""
+    if config_path is None:
+        try:
+            from utils.yaml_config_manager import get_user_config_path
+            config_path = get_user_config_path()
+        except Exception:
+            config_path = DEFAULT_CONFIG_PATH
+    return restore_latest_backup(config_path)
+
+
+def has_config_backup(config_path: Optional[Path] = None) -> bool:
+    """Check if a .bak backup exists for config.yaml."""
+    if config_path is None:
+        try:
+            from utils.yaml_config_manager import get_user_config_path
+            config_path = get_user_config_path()
+        except Exception:
+            config_path = DEFAULT_CONFIG_PATH
+    return get_latest_backup_path(config_path) is not None
+
+
+def run_asshead_migration(config_path: Path, template_url: str = TEMPLATE_SOURCE_URL) -> tuple[bool, str, Optional[Path]]:
+    return repair_and_sync_config(config_path, online=True)
 
 
 # ──────────────────────────────────────────────────────────────
 # CLI entry point
 # ──────────────────────────────────────────────────────────────
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -1317,13 +1596,12 @@ def main() -> None:
         error(f"Failed to fetch template: {exc}")
         sys.exit(1)
 
-    key_types = infer_key_types(raw_hpp)
+    key_types = infer_key_types(raw_hpp, config_path=config_path)
 
-    m_tmpl = re.search(r'static const char\* defaultConfig = R"\((.+?)\)";', raw_hpp, re.DOTALL)
-    if not m_tmpl:
-        error("Could not find YAML template in the downloaded C++ file.")
+    template_yaml = extract_template_yaml(raw_hpp)
+    if not template_yaml:
+        error("Could not find YAML template in the downloaded template file.")
         sys.exit(1)
-    template_yaml = m_tmpl.group(1)
 
     ok(f"  Discovered {len(key_types)} top-level key(s) in upstream template.")
     unknown = [k for k, t in key_types.items() if t == TYPE_UNKNOWN]
@@ -1386,8 +1664,9 @@ def main() -> None:
     # ── 3. Compare ───────────────────────────────────────────────
     print(f"{BOLD}[3/4] Comparing with upstream template…{RESET}")
     template_data = reader.parse(template_yaml)
+    plugin_keys   = get_effective_plugin_keys(config_path)
     new_keys      = set(template_data) - set(old_data)
-    removed_keys  = set(old_data)      - set(template_data)
+    removed_keys  = set(old_data)      - set(template_data) - set(plugin_keys)
     if new_keys:
         info(f"  New upstream key(s) — using defaults: {', '.join(sorted(new_keys))}")
     if removed_keys:
@@ -1398,7 +1677,7 @@ def main() -> None:
 
     # ── 4. Merge ─────────────────────────────────────────────────
     print(f"{BOLD}[4/4] Merging your values into new template…{RESET}")
-    merged = merge_config(template_yaml, old_data, key_types)
+    merged = merge_config(template_yaml, old_data, key_types, config_path=config_path)
 
     for key in key_types:
         old_val = old_data.get(key)
